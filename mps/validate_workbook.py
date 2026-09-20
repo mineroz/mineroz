@@ -3,10 +3,14 @@
 validate_workbook.py - build, recalculate and independently verify the MPS workbook.
 
 What it does
-  1. builds three workbooks with build_workbook.py:
+  1. builds four workbooks with build_workbook.py:
        demo    : 74 days of synthetic DEMO data, report date fixed to 10 Feb
        default : the same data, report date left to the workbook's default formula
        blank   : no data at all
+       edge    : the demo with partially entered rows (missing grades, missing run
+                 hours, a full-day shutdown, an ungraded ore row, an unknown source,
+                 a row dated in the prior year) plus a Probe sheet that measures every
+                 lst_ drop-down name
   2. recalculates them with LibreOffice (headless) and reads the values back
   3. recomputes the key figures in plain Python from Builder.sample (the synthetic
      rows, in schema field order) without using any workbook formula, and compares
@@ -164,8 +168,9 @@ class Checks:
 class Sample:
     """Builder.sample rows (list of lists in schema field order) as dicts keyed by field name."""
 
-    def __init__(self, builder):
+    def __init__(self, builder, sample: dict | None = None):
         self.b = builder
+        self.sample = sample if sample is not None else builder.sample
         s = builder.s
         self.troy = float(s["constants"]["TROY_OZ_G"])
         self.fields = {t["table"]: [f["name"] for f in t["fields"] if not f.get("calc")] for t in s["tables"]}
@@ -181,7 +186,7 @@ class Sample:
             return self._cache[table]
         names = self.fields[table]
         out = []
-        for row in self.b.sample.get(table, []):
+        for row in self.sample.get(table, []):
             if len(row) != len(names):
                 self.width_problems.append(f"{table}: row has {len(row)} values for {len(names)} fields")
             out.append({n: (row[i] if i < len(row) else None) for i, n in enumerate(names)})
@@ -222,12 +227,15 @@ KIND = {
     "Gold_Poured_oz": True, "Throughput_tph": False, "Mill_Availability_pct": False, "Mill_Utilisation_pct": False,
     "Cyanide_kgpt": False, "Hours_Worked": True, "Recordables": True, "LTI": True, "Gold_Shipped_oz": True, "Gold_Sold_oz": True,
     "GIC_oz": True, "Days_Since_LTI": True, "TRIFR_12m": False, "LTIFR_12m": False,
+    "Ore_Ungraded_t": True, "Unclassified_t": True, "Tails_Grade_gpt": False, "Mill_Calendar_h": True,
     "Bud_Milled_t_MTD": False, "Bud_Milled_t_YTD": False, "Bud_Ore_Grade_gpt_MTD": False, "Bud_Recovery_pct_YTD": False,
 }
 
 
 def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
-    """Recompute the KPI set for one date, per period, straight from the sample rows."""
+    """Recompute the KPI set for one date, per period, straight from the sample rows.
+    Blank means not reported: a row whose grade, tails grade or run hours is blank contributes nothing to the
+    ratio that needs it (the tonnes are paired with the assay or the hours that carry them)."""
     T = S.troy
     mv, pl, sf, gd = S.rows("tblMovement"), S.rows("tblPlant"), S.rows("tblSafety"), S.rows("tblGold")
 
@@ -237,14 +245,23 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
     def pit_ore(r):
         return pit(r) and S.is_ore(r["Material"])
 
+    def graded(r):
+        return r.get("Grade_gpt") is not None
+
     def milled(r):
         return num(r["Milled_t"])
 
+    def has(r, *cols):
+        return all(r[c] is not None for c in cols)
+
     def feed_oz(r):
-        return milled(r) * num(r["Head_Grade_gpt"]) / T
+        return milled(r) * num(r["Head_Grade_gpt"]) / T if has(r, "Milled_t", "Head_Grade_gpt") else 0.0
+
+    def tails_oz(r):
+        return milled(r) * num(r["Tails_Grade_gpt"]) / T if has(r, "Milled_t", "Tails_Grade_gpt") else 0.0
 
     def rec_oz(r):
-        return milled(r) * (num(r["Head_Grade_gpt"]) - num(r["Tails_Grade_gpt"])) / T
+        return feed_oz(r) - tails_oz(r) if has(r, "Milled_t", "Head_Grade_gpt", "Tails_Grade_gpt") else 0.0
 
     def hours(r):
         return num(r["Hours_Employees"]) + num(r["Hours_Contractors"])
@@ -259,17 +276,24 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
 
     for p in ("Day", "MTD", "YTD"):
         ore_t = total(mv, d, p, lambda r: float(r["Tonnes_t"]) if pit_ore(r) else 0.0)
+        ore_graded_t = total(mv, d, p, lambda r: float(r["Tonnes_t"]) if pit_ore(r) and graded(r) else 0.0)
         ore_oz = total(mv, d, p, lambda r: S.oz(r) if pit_ore(r) else 0.0)
         waste_t = total(mv, d, p, lambda r: float(r["Tonnes_t"]) if pit(r) and not S.is_ore(r["Material"]) else 0.0)
         rehandle = total(mv, d, p, lambda r: float(r["Tonnes_t"]) if S.src_type.get(r["Source"]) == "Stockpile" else 0.0)
+        moved = total(mv, d, p, lambda r: float(r["Tonnes_t"]))
         mil = total(pl, d, p, milled)
+        mil_head = total(pl, d, p, lambda r: milled(r) if r["Head_Grade_gpt"] is not None else 0.0)
+        mil_tails = total(pl, d, p, lambda r: milled(r) if r["Tails_Grade_gpt"] is not None else 0.0)
+        mil_timed = total(pl, d, p, lambda r: milled(r) if r["Mill_Run_h"] is not None else 0.0)
         fz = total(pl, d, p, feed_oz)
+        fz_recon = total(pl, d, p, lambda r: feed_oz(r) if r["Tails_Grade_gpt"] is not None else 0.0)
+        tz = total(pl, d, p, tails_oz)
         rz = total(pl, d, p, rec_oz)
         poured = total(pl, d, p, lambda r: num(r["Gold_Poured_oz"]))
         run_h = total(pl, d, p, lambda r: num(r["Mill_Run_h"]))
         plan_h = total(pl, d, p, lambda r: num(r["Mill_Planned_Maint_h"]))
         unpl_h = total(pl, d, p, lambda r: num(r["Mill_Unplanned_Down_h"]))
-        cal_h = total(pl, d, p, lambda r: 24.0 if r["Mill_Run_h"] is not None else 0.0)
+        cal_h = total(pl, d, p, lambda r: 24.0 if any(r[c] is not None for c in ("Mill_Run_h", "Mill_Planned_Maint_h", "Mill_Unplanned_Down_h")) else 0.0)
         cn_kg = total(pl, d, p, lambda r: num(r["Cyanide_kg"]))
         hrs = total(sf, d, p, hours)
         rec = total(sf, d, p, recordables)
@@ -278,18 +302,22 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
         sold = total(gd, d, p, lambda r: num(r["Gold_oz"]) if r["Type"] == "Sale" else 0.0)
         put("Ore_Mined_t", p, ore_t)
         put("Ore_Mined_oz", p, ore_oz)
-        put("Ore_Grade_gpt", p, div(ore_oz * T, ore_t))
+        put("Ore_Grade_gpt", p, div(ore_oz * T, ore_graded_t))
+        put("Ore_Ungraded_t", p, ore_t - ore_graded_t)
         put("Waste_t", p, waste_t)
         put("TMM_t", p, ore_t + waste_t)
         put("Strip_Ratio", p, div(waste_t, ore_t))
         put("Rehandle_t", p, rehandle)
+        put("Unclassified_t", p, moved - ore_t - waste_t - rehandle)
         put("Milled_t", p, mil)
         put("Feed_oz", p, fz)
         put("Recovered_oz", p, rz)
-        put("Head_Grade_gpt", p, div(fz * T, mil))
-        put("Recovery_pct", p, div(rz, fz))
+        put("Head_Grade_gpt", p, div(fz * T, mil_head))
+        put("Tails_Grade_gpt", p, div(tz * T, mil_tails))
+        put("Recovery_pct", p, div(rz, fz_recon))
         put("Gold_Poured_oz", p, poured)
-        put("Throughput_tph", p, div(mil, run_h))
+        put("Throughput_tph", p, div(mil_timed, run_h))
+        put("Mill_Calendar_h", p, cal_h)
         put("Mill_Availability_pct", p, div(cal_h - plan_h - unpl_h, cal_h))
         put("Mill_Utilisation_pct", p, div(run_h, cal_h - plan_h - unpl_h))
         put("Cyanide_kgpt", p, div(cn_kg, mil))
@@ -306,14 +334,19 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
     lti_days = [r["Date"] for r in sf if num(r["LTI"]) > 0 and r["Date"] <= d]
     cands = [x for x in (prior, max(lti_days) if lti_days else None) if x]
     put("Days_Since_LTI", "Day", float((d - max(cands)).days) if cands else None)
-    # rolling 12 months + month to date: window from the same month one year earlier
+    # rolling 12 months + month to date: window from the same month one year earlier; history months are used
+    # for months in the window before the current month that have no daily hours
     hist = S.rows("tblSafetyHistory")
     ms = date(d.year, d.month, 1)
     win = date(ms.year - 1, ms.month, 1)
-    ys = date(d.year, 1, 1)
+
+    def use_hist(h):
+        m = h["Month"]
+        return win <= m < ms and not any(hours(r) > 0 for r in sf if (r["Date"].year, r["Date"].month) == (m.year, m.month))
+
     for key, cur_fn, hist_col in (("TRIFR_12m", recordables, "Recordables"), ("LTIFR_12m", lambda r: num(r["LTI"]), "LTI")):
-        n = sum(cur_fn(r) for r in sf if win <= r["Date"] <= d) + sum(num(h[hist_col]) for h in hist if win <= h["Month"] < ys)
-        dd = sum(hours(r) for r in sf if win <= r["Date"] <= d) + sum(num(h["Hours_Total"]) for h in hist if win <= h["Month"] < ys)
+        n = sum(cur_fn(r) for r in sf if win <= r["Date"] <= d) + sum(num(h[hist_col]) for h in hist if use_hist(h))
+        dd = sum(hours(r) for r in sf if win <= r["Date"] <= d) + sum(num(h["Hours_Total"]) for h in hist if use_hist(h))
         put(key, "Day", n / dd * 1_000_000 if dd > 0 else None)
     return out
 
@@ -349,7 +382,7 @@ def expected_budgets(S: Sample, d: date) -> dict[str, object]:
 
 def expected_stockpiles(S: Sample, rd: date) -> list[dict]:
     T = S.troy
-    mv = [r for r in S.rows("tblMovement") if r["Date"] <= rd]
+    mv = [r for r in S.rows("tblMovement") if date(rd.year, 1, 1) <= r["Date"] <= rd]   # rows before the opening survey are not part of the balance
     pl = [r for r in S.rows("tblPlant") if r["Date"] <= rd]
     milled = sum(num(r["Milled_t"]) for r in pl)
     feed_oz = sum(num(r["Milled_t"]) * num(r["Head_Grade_gpt"]) / T for r in pl)
@@ -440,25 +473,42 @@ def chart_guard_allowed(wb, series, last):
 
 
 # ----------------------------------------------------------------------------- checks
-def check_calc_daily(C: Checks, S: Sample, cd: CalcDaily):
-    for d in CHECK_DATES:
+def check_calc_daily(C: Checks, S: Sample, cd: CalcDaily, dates=CHECK_DATES, tag="Calc_Daily", budgets=True):
+    for d in dates:
         exp = expected_kpis(S, d)
         for key, periods in exp.items():
             for period, val in periods.items():
                 hdr = key if period == "Day" else f"{key}_{period}"
-                C.num(f"Calc_Daily {d} {hdr}", val, cd.get(d, hdr), TOL_SUM if KIND[key] else TOL_RATIO)
-        for hdr, val in expected_budgets(S, d).items():
-            C.num(f"Calc_Daily {d} {hdr}", val, cd.get(d, hdr), TOL_RATIO)
+                C.num(f"{tag} {d} {hdr}", val, cd.get(d, hdr), TOL_SUM if KIND[key] else TOL_RATIO)
+        if budgets:
+            for hdr, val in expected_budgets(S, d).items():
+                C.num(f"{tag} {d} {hdr}", val, cd.get(d, hdr), TOL_RATIO)
+
+
+def expected_checks_line(S: Sample, rd: date) -> str:
+    """The Daily_Report B7 completeness line, from the sample rows."""
+    def n(table, cond=lambda r: True):
+        return sum(1 for r in S.rows(table) if r["Date"] == rd and cond(r))
+    mv = S.rows("tblMovement")
+    unknown = sum(1 for r in mv if r["Source"] and r["Source"] not in S.src_type) + sum(1 for r in mv if r["Destination"] and r["Destination"] not in S.dst_type)
+    outside = sum(1 for r in mv if r["Date"].year != rd.year)
+    return (f"Rows for this date: Plant {n('tblPlant', lambda r: r['Milled_t'] is not None)}, Movements {n('tblMovement')}, Fleet {n('tblFleet')}, "
+            f"Mining daily {n('tblMiningDaily', lambda r: r['Diesel_L'] is not None)}, Safety {n('tblSafety', lambda r: r['Hours_Employees'] is not None)}, "
+            f"Comments {n('tblCommentary')}  |  Movement rows with unknown source or destination: {unknown}  |  Movement rows dated outside the year: {outside}")
 
 
 def var(a, b):
     return a / b - 1 if is_num(a) and is_num(b) and b != 0 else None
 
 
-def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date):
+def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date, tag="Daily_Report"):
     ws = wb["Daily_Report"]
-    C.eq("Daily_Report C5 report date", rd, ws["C5"].value)
-    C.eq("Daily_Report rpt_Row (L5) = day of year", float((rd - date(YEAR, 1, 1)).days + 1), ws["L5"].value)
+    C.eq(f"{tag} C5 report date", rd, ws["C5"].value)
+    C.eq(f"{tag} rpt_Row (L5) = day of year", float((rd - date(YEAR, 1, 1)).days + 1), ws["L5"].value)
+    C.eq(f"{tag} B7 completeness line (rpt_Checks)", expected_checks_line(S, rd), ws["B7"].value)
+    C.eq(f"{tag} cfg_FeedCheck (exactly one Plant_Feed = Y)", "OK", config_values(wb).get("cfg_FeedCheck"))
+    r0 = find_row(ws, 2, "STOCKPILES")
+    C.eq(f"{tag} plant feed warning line blank", None, ws.cell(r0 - 1, 2).value if r0 else "<no STOCKPILES block>")
     rows: dict[str, int] = {}
     for r in range(1, ws.max_row + 1):
         v = ws.cell(r, 2).value
@@ -488,7 +538,7 @@ def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date):
                 got = norm(ws.cell(r, col).value)
                 if not close(w, got, TOL_SAME):
                     mism.append(f"{k['label']} {get_column_letter(col)}{r} exp {fmt(w)} got {fmt(got)}")
-        C.group(f"Daily_Report {section} cells vs Calc_Daily", n, mism)
+        C.group(f"{tag} {section} cells vs Calc_Daily", n, mism)
     # stockpiles, recomputed independently
     r0 = find_row(ws, 2, "STOCKPILES")
     exp_sp = expected_stockpiles(S, rd)
@@ -504,8 +554,8 @@ def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date):
                 mism.append(f"{e['name']} {get_column_letter(col)}{r} exp {fmt(e[key])} got {fmt(got.get(col))}")
         if not (e["bal"] >= 0 and (e["grade"] is None or 0 <= e["grade"] <= 10)):
             plaus.append(f"{e['name']} balance {fmt(e['bal'])} t at {fmt(e['grade'])} g/t")
-    C.group("Daily_Report stockpile block (independent)", n, mism)
-    C.group("Daily_Report stockpile balances plausible (t >= 0, 0 to 10 g/t)", len(exp_sp), plaus)
+    C.group(f"{tag} stockpile block (independent)", n, mism)
+    C.group(f"{tag} stockpile balances plausible (t >= 0, 0 to 10 g/t)", len(exp_sp), plaus)
     # commentary in entry order
     r0 = find_row(ws, 2, "COMMENTARY")
     comments = [(c["Area"], c["Comment"]) for c in S.rows("tblCommentary") if c["Date"] == rd]
@@ -517,8 +567,8 @@ def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date):
         n += 1
         if got != e:
             mism.append(f"line {i + 1} exp {e} got {got}")
-    C.add("Daily_Report commentary lines for report date", f"{len(comments)} comments, entry order", f"{len(comments)} comments" if not mism else mism[0], not mism)
-    C.add("Daily_Report commentary count fits the block", f"<= {bw.COMMENT_LINES}", str(len(comments)), len(comments) <= bw.COMMENT_LINES)
+    C.add(f"{tag} commentary lines for report date", f"{len(comments)} comments, entry order", f"{len(comments)} comments" if not mism else mism[0], not mism)
+    C.add(f"{tag} commentary count fits the block", f"<= {bw.COMMENT_LINES}", str(len(comments)), len(comments) <= bw.COMMENT_LINES)
 
 
 def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
@@ -532,11 +582,13 @@ def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
     r = actual_rows[bw.KPI["Milled_t"]["label"]]
     pl = S.rows("tblPlant")
     bud = {row["Month"]: row for row in S.rows("tblBudget")}
+    # budget: full month, except the month in progress (pro-rata to the last data date); year = YTD budget at that date
     exp_act, exp_bud = {}, {}
     for m in range(1, 13):
         ms = date(YEAR, m, 1)
         exp_act[m] = sum(num(p["Milled_t"]) for p in pl if p["Date"].month == m and p["Date"] <= last) if ms <= last else None
-        exp_bud[m] = num(bud[ms]["Milled_t"]) if ms in bud else 0.0
+        full = num(bud[ms]["Milled_t"]) if ms in bud else 0.0
+        exp_bud[m] = full * last.day / calendar.monthrange(YEAR, m)[1] if m == last.month else full
     for m in (1, 2, 3, 4):
         C.num(f"Monthly_Summary Milled {MONTHS[m - 1]} actual", exp_act[m], ws.cell(r, 3 + m).value)
     ytd = sum(num(p["Milled_t"]) for p in pl if p["Date"] <= last)
@@ -544,18 +596,18 @@ def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
     mism_b, mism_v = [], []
     for m in range(1, 13):
         got_b = norm(ws.cell(r + 1, 3 + m).value)
-        if not close(exp_bud[m], got_b, TOL_SUM):
+        if not close(exp_bud[m], got_b, TOL_RATIO):
             mism_b.append(f"{MONTHS[m - 1]} exp {fmt(exp_bud[m])} got {fmt(got_b)}")
         got_v = norm(ws.cell(r + 2, 3 + m).value)
         ev = var(exp_act[m], exp_bud[m])
         if not close(ev, got_v, TOL_RATIO):
             mism_v.append(f"{MONTHS[m - 1]} exp {fmt(ev)} got {fmt(got_v)}")
-    annual = sum(exp_bud.values())
-    if not close(annual, ws.cell(r + 1, 16).value, TOL_SUM):
-        mism_b.append(f"Year exp {fmt(annual)} got {fmt(ws.cell(r + 1, 16).value)}")
-    if not close(var(ytd, annual), ws.cell(r + 2, 16).value, TOL_RATIO):
-        mism_v.append(f"Year exp {fmt(var(ytd, annual))} got {fmt(ws.cell(r + 2, 16).value)}")
-    C.group("Monthly_Summary Milled budget row = tblBudget (12 months + year)", 13, mism_b)
+    ytd_bud = sum(v for m, v in exp_bud.items() if m <= last.month)
+    if not close(ytd_bud, ws.cell(r + 1, 16).value, TOL_RATIO):
+        mism_b.append(f"Year exp {fmt(ytd_bud)} got {fmt(ws.cell(r + 1, 16).value)}")
+    if not close(var(ytd, ytd_bud), ws.cell(r + 2, 16).value, TOL_RATIO):
+        mism_v.append(f"Year exp {fmt(var(ytd, ytd_bud))} got {fmt(ws.cell(r + 2, 16).value)}")
+    C.group("Monthly_Summary Milled budget row = tblBudget, pro-rata for the current month (12 months + year)", 13, mism_b)
     C.group("Monthly_Summary Milled variance row = actual / budget - 1", 13, mism_v)
     # every monthly KPI row against Calc_Daily
     mism, n = [], 0
@@ -576,7 +628,7 @@ def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
                 mism.append(f"{k['label']} {MONTHS[m - 1]} exp {fmt(want)} got {fmt(got)}")
             if b.has_budget(k):
                 n += 1
-                wb_ = cd.get(ms, f"Bud_{key}_Month")
+                wb_ = cd.get(me, f"Bud_{key}_MTD") if ms <= last else cd.get(ms, f"Bud_{key}_Month")
                 got_b = norm(ws.cell(r + 1, 3 + m).value)
                 if not close(wb_, got_b, TOL_SAME):
                     mism.append(f"{k['label']} {MONTHS[m - 1]} budget exp {fmt(wb_)} got {fmt(got_b)}")
@@ -636,6 +688,10 @@ def check_blank(C: Checks, wb, series):
     ws = wb["Daily_Report"]
     title = norm(ws["B2"].value)
     C.add("Blank Daily_Report title renders", "text", fmt(title), isinstance(title, str) and bool(title))
+    C.eq("Blank cfg_FeedCheck (schema stockpiles)", "OK", cfg.get("cfg_FeedCheck"))
+    C.add("Blank Daily_Report B7 completeness line all zero", "Plant 0 ... outside the year: 0", fmt(ws["B7"].value),
+          isinstance(ws["B7"].value, str) and ws["B7"].value.startswith("Rows for this date: Plant 0, Movements 0, Fleet 0, Mining daily 0, Safety 0, Comments 0")
+          and ws["B7"].value.endswith("outside the year: 0"))
     today = date.today()
     exp_default = max(date(YEAR, 1, 1), min(today - timedelta(days=1), date(YEAR, 12, 31)))
     c5 = as_date(ws["C5"].value)
@@ -654,6 +710,101 @@ def check_blank(C: Checks, wb, series):
                 if v is not None and v != 0:
                     bad.append(f"{get_column_letter(col)}{r}={fmt(v)}")
     C.group("Blank Daily_Report KPI cells blank or zero", n, bad)
+
+
+# ----------------------------------------------------------------------------- edge workbook and list probe
+EDGE_DATES = [date(YEAR, 2, d) for d in (5, 6, 7, 8, 9, 10)]
+
+
+def list_catalogue(schema: dict) -> dict[str, list]:
+    """Every lst_ name the generator defines: schema lists, derived lists and the key column of Lists-sheet reference tables."""
+    out = dict(schema["lists"])
+    out.update(schema.get("derived_lists", {}))
+    for rdef in schema["reference_tables"].values():
+        if rdef["sheet"] == "Lists":
+            out[rdef["key"]] = [row[0] for row in rdef["rows"]]
+    return out
+
+
+def make_edge(b, out: Path) -> Sample:
+    """Copy the demo builder's workbook and sample with partially entered rows, add the lst_ probe sheet, save."""
+    import copy
+    smp = copy.deepcopy(b.sample)
+    S = Sample(b, smp)
+    wb = b.wb
+    edits = {  # table -> (row date, {field: value})
+        "tblPlant": [(date(YEAR, 2, 5), {"Tails_Grade_gpt": None}), (date(YEAR, 2, 6), {"Head_Grade_gpt": None}),
+                     (date(YEAR, 2, 7), {"Mill_Run_h": None}),
+                     (date(YEAR, 2, 8), {"Milled_t": 0, "Mill_Run_h": None, "Mill_Planned_Maint_h": 24, "Mill_Unplanned_Down_h": 0})],
+    }
+    for tbl, items in edits.items():
+        info = b.tables[tbl]
+        ws = wb[info["sheet"]]
+        names = S.fields[tbl]
+        for d, vals in items:
+            r = info["first"] + (d - date(YEAR, 1, 1)).days
+            row = smp[tbl][(d - date(YEAR, 1, 1)).days]
+            assert row[0] == d
+            for k, v in vals.items():
+                row[names.index(k)] = v
+                ws[f"{info['cols'][k]}{r}"] = v
+    # ungraded ore row on 9 Feb (first Petowal Pit Ore HG row of that day), an unknown source and a prior-year row
+    info = b.tables["tblMovement"]
+    ws = wb[info["sheet"]]
+    names = S.fields["tblMovement"]
+    mv = smp["tblMovement"]
+    i9 = next(i for i, row in enumerate(mv) if row[0] == date(YEAR, 2, 9) and row[3] == "Ore HG")
+    mv[i9][names.index("Grade_gpt")] = None
+    ws[f"{info['cols']['Grade_gpt']}{info['first'] + i9}"] = None
+    extra = [[date(YEAR - 1, 12, 31), None, "Petowal Pit", "Ore HG", "ROM Pad", 777, 2.0, None, None, None],
+             [date(YEAR, 2, 10), None, "Unknown Pit", "Ore HG", "ROM Pad", 1000, 2.0, None, None, None]]
+    for row in extra:
+        r = info["first"] + len(mv)
+        mv.append(row)
+        for k, v in zip(names, row):
+            if v is not None:
+                ws[f"{info['cols'][k]}{r}"] = v
+    # probe sheet: size, first and last entry of every drop-down name
+    pr = wb.create_sheet("Probe")
+    pr.append(["name", "rows", "first", "last"])
+    for lname in list_catalogue(b.s):
+        pr.append([lname, f"=ROWS(lst_{lname})", f"=INDEX(lst_{lname},1)", f"=INDEX(lst_{lname},ROWS(lst_{lname}))"])
+    wb.save(out)
+    S._cache.clear()
+    return S
+
+
+def check_lists(C: Checks, b, wb_edge):
+    """Every lst_ name covers exactly the schema list (F001), and every list field validates against its name."""
+    cat = list_catalogue(b.s)
+    got = {row[0]: row[1:] for row in wb_edge["Probe"].iter_rows(min_row=2, values_only=True) if row[0]}
+    bad = []
+    for lname, values in cat.items():
+        g = got.get(lname)
+        exp = (float(len(values)), values[0], values[-1])
+        if g is None or tuple(norm(x) for x in g) != exp:
+            bad.append(f"lst_{lname} exp {exp} got {g}")
+    C.group("Lists: ROWS/first/last of every lst_ name = schema list (LibreOffice)", len(cat), bad)
+    bad, n = [], 0
+    fields = [(t["table"], f) for t in b.s["tables"] for f in t["fields"]]
+    fields += [(rdef["table"], c) for rdef in b.s["reference_tables"].values() for c in rdef["columns"]]
+    for tbl, f in fields:
+        if f.get("type") != "list":
+            continue
+        n += 1
+        info = b.tables[tbl]
+        ws = b.wb[info["sheet"]]
+        want = f"=lst_{f['list']}"
+        col_ref = f"{info['cols'][f['name']]}{info['first']}"
+        dvs = [dv for dv in ws.data_validations.dataValidation if dv.formula1 == want and col_ref in dv.sqref]
+        if not dvs:
+            bad.append(f"{tbl}[{f['name']}] has no list validation {want} on {col_ref}")
+        elif f"lst_{f['list']}" not in b.wb.defined_names:
+            bad.append(f"{tbl}[{f['name']}]: name lst_{f['list']} missing")
+    C.group("Lists: every list field validates against an existing lst_ name", n, bad)
+    req = [f"{r}.Type" for r, rdef in b.s["reference_tables"].items() if r in ("Sources", "Destinations")
+           and not any(c["name"] == "Type" and c.get("required") for c in rdef["columns"])]
+    C.group("Schema: Sources.Type and Destinations.Type are required", 2, [f"{x} not required" for x in req])
 
 
 # ----------------------------------------------------------------------------- driver
@@ -692,11 +843,12 @@ def main(argv=None) -> int:
     try:
         print(f"work folder: {work}")
         print("building workbooks ...", flush=True)
-        f_demo, f_default, f_blank = built / "MPS_demo.xlsx", built / "MPS_demo_default_date.xlsx", built / "MPS_blank.xlsx"
+        f_demo, f_default, f_blank, f_edge = built / "MPS_demo.xlsx", built / "MPS_demo_default_date.xlsx", built / "MPS_blank.xlsx", built / "MPS_edge.xlsx"
         b = bw.build(schema, f_demo, YEAR, SAMPLE_DAYS, REPORT_DATE)
         bw.build(schema, f_default, YEAR, SAMPLE_DAYS, None)
         bw.build(schema, f_blank, YEAR, 0, None)
         S = Sample(b)
+        S_edge = make_edge(b, f_edge)   # after Sample(b): the edge edits the builder's workbook in place
         last = S.last_plant_date()
         C.eq("Sample last day with data", CHECK_DATES[-1], last)
         # the Config cell must hold the formula, not a pasted date (the earlier override bug)
@@ -708,7 +860,7 @@ def main(argv=None) -> int:
         C.group("Sample rows match schema field order (width)", len(S.fields), S.width_problems)
 
         print("recalculating with LibreOffice ...", flush=True)
-        r_demo, r_default, r_blank = recalc([f_demo, f_default, f_blank], work / "recalc", a.soffice)
+        r_demo, r_default, r_blank, r_edge = recalc([f_demo, f_default, f_blank, f_edge], work / "recalc", a.soffice)
 
         print("checking the DEMO workbook ...", flush=True)
         wb = load(r_demo)
@@ -734,6 +886,17 @@ def main(argv=None) -> int:
         print("checking the blank workbook ...", flush=True)
         wb = load(r_blank)
         check_blank(C, wb, b.chart_series)
+        wb.close()
+
+        print("checking the edge workbook (partial rows) and the drop-down lists ...", flush=True)
+        wb = load(r_edge)
+        cd = CalcDaily(wb["Calc_Daily"])
+        check_calc_daily(C, S_edge, cd, EDGE_DATES, "Edge Calc_Daily", budgets=False)
+        check_daily_report(C, S_edge, b, wb, cd, REPORT_DATE, tag="Edge Daily_Report")
+        found = scan_errors(wb, chart_guard_allowed(wb, b.chart_series, last))
+        C.add("Edge error values outside the Chart_Data guard", "0",
+              str(sum(len(v) for v in found.values())) + (" " + "; ".join(f"{k}: {v[0]}" for k, v in found.items())[:60] if found else ""), not found)
+        check_lists(C, b, wb)
         wb.close()
 
         print("running xl_inspect ...", flush=True)
