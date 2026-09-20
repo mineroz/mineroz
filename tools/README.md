@@ -16,6 +16,14 @@ For each workbook it reports:
 
 Legacy `.xls` and binary `.xlsb` are listed but not parsed; save them as `.xlsm` first.
 
+The scan streams every sheet (openpyxl read-only) and reads sheet features straight from the
+XML, so memory stays flat on large workbooks and a bloated declared range (for example
+`A1:Z1048576` with 400 real rows) costs nothing. Such sheets are flagged `BLOAT` in the report.
+
+`Invoke-XlInspect.ps1` finds a real Python 3 (it ignores the Microsoft Store stub in
+`WindowsApps`). If none is installed it installs Python 3.12 for the current user from
+python.org without admin rights, falling back to winget. Pass `-NoInstall` to disable this.
+
 ### Run
 
 Windows, from the repo root:

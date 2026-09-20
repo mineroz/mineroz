@@ -6,6 +6,11 @@ Purpose: inventory everything that makes a workbook fragile before rebuilding it
 from scratch: external links, VBA, defined names, hidden sheets, cross-sheet
 dependency graph, volatile functions, broken references, data connections.
 
+Runs in streaming mode (openpyxl read-only) so multi-hundred-MB workbooks are
+handled in bounded memory. Sheet metadata (validations, conditional formats,
+merges, protection, freeze panes, declared dimension) is read directly from the
+sheet XML in chunks.
+
 Usage:
     python xl_inspect.py <folder-or-file> [more files...] [-o OUTPUT_DIR]
 
@@ -23,12 +28,13 @@ import json
 import os
 import re
 import sys
+import time
 import warnings
 import zipfile
-from urllib.parse import unquote
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote
 from xml.etree import ElementTree as ET
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
@@ -46,13 +52,6 @@ try:
 except Exception:  # pragma: no cover
     HAVE_OLEVBA = False
 
-try:
-    import olefile  # type: ignore
-
-    HAVE_OLEFILE = True
-except Exception:  # pragma: no cover
-    HAVE_OLEFILE = False
-
 
 NS = {
     "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
@@ -63,16 +62,29 @@ NS = {
 VOLATILE = ("OFFSET(", "INDIRECT(", "NOW(", "TODAY(", "RAND(", "RANDBETWEEN(", "CELL(", "INFO(")
 LOOKUPS = ("VLOOKUP(", "HLOOKUP(", "XLOOKUP(", "INDEX(", "MATCH(", "SUMIFS(", "SUMIF(", "COUNTIFS(", "SUMPRODUCT(", "GETPIVOTDATA(")
 ERROR_VALUES = ("#REF!", "#N/A", "#VALUE!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!")
-LARGE_FILE_MB = 60  # above this, cell scan runs in read-only mode
+BLOAT_MIN_ROWS = 10000  # declared rows above this, and > 2x the real used rows, is flagged as bloat
 
-# 'Sheet Name'!A1  or  SheetName!A1  or  [1]Sheet!A1  or  'C:\path\[Book.xlsx]Sheet'!A1
+# 'Sheet Name'!A1  or  SheetName!A1 ; skip [n]Sheet!A1 (external) and #REF!
 SHEET_REF_RE = re.compile(r"(?<![\]#A-Za-z0-9_\.])(?:'((?:[^']|'')+)'|([A-Za-z0-9_\.]+))!")
 EXT_INDEX_RE = re.compile(r"\[(\d+)\]")
 VBA_PROC_RE = re.compile(r"^\s*(?:Public\s+|Private\s+|Friend\s+)?(?:Static\s+)?(Sub|Function|Property\s+(?:Get|Let|Set))\s+([A-Za-z_][A-Za-z0-9_]*)", re.I | re.M)
 VBA_RISK_RE = re.compile(r"\b(Shell|Kill|CreateObject|GetObject|Application\.OnTime|SendKeys|Environ|FileCopy|RmDir|MkDir|Workbooks\.Open|ActiveWorkbook\.SaveAs|DisplayAlerts\s*=\s*False|On Error Resume Next|Sheets\([^)]*\)\.Delete|\.Delete)\b", re.I)
 
+# byte patterns counted in sheet XML (trailing space excludes the plural container elements)
+SHEET_XML_COUNTERS = {
+    "data_validations": (b"<dataValidation ", b"<x14:dataValidation "),
+    "conditional_formats": (b"<cfRule ", b"<x14:cfRule "),
+    "merged_ranges": (b"<mergeCell ",),
+    "hyperlinks": (b"<hyperlink ",),
+    "protected": (b"<sheetProtection",),
+    "freeze_panes": (b'state="frozen"',),
+    "legacy_drawing": (b"<legacyDrawing",),
+    "controls": (b"<control ",),
+}
+DIMENSION_RE = re.compile(rb'<dimension ref="([A-Z]+\d+(?::[A-Z]+\d+)?)"')
 
-def human_size(n: int) -> str:
+
+def human_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
@@ -80,27 +92,79 @@ def human_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
-def parse_external_links(zf: zipfile.ZipFile) -> list[dict]:
-    """Return list of external link targets in workbook order (index 1-based as used in formulas)."""
-    links = []
-    # workbook.xml.rels gives the order of externalLink parts as they appear in workbook.xml <externalReferences>
+# ----------------------------------------------------------------------------- package-level XML
+
+def workbook_xml(zf: zipfile.ZipFile) -> tuple[ET.Element | None, dict[str, str]]:
     try:
         wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
         wb_rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
     except KeyError:
-        return links
+        return None, {}
     rid_to_target = {r.get("Id"): r.get("Target") for r in wb_rels.findall("rel:Relationship", NS)}
+    return wb_xml, rid_to_target
+
+
+def parse_sheets(wb_xml: ET.Element | None, rid_to_target: dict[str, str]) -> list[dict]:
+    """Ordered sheets with name, state and part path, straight from workbook.xml."""
+    out = []
+    if wb_xml is None:
+        return out
+    sheets = wb_xml.find("m:sheets", NS)
+    if sheets is None:
+        return out
+    for i, s in enumerate(sheets.findall("m:sheet", NS)):
+        rid = s.get(f"{{{NS['r']}}}id")
+        target = rid_to_target.get(rid, "") or ""
+        part = target.lstrip("/")
+        if not part.startswith("xl/"):
+            part = "xl/" + part
+        out.append({"index": i, "name": s.get("name"), "state": s.get("state", "visible"), "part": part, "sheet_id": s.get("sheetId")})
+    return out
+
+
+def parse_defined_names(wb_xml: ET.Element | None, sheets: list[dict]) -> list[dict]:
+    out = []
+    if wb_xml is None:
+        return out
+    dn = wb_xml.find("m:definedNames", NS)
+    if dn is None:
+        return out
+    for d in dn.findall("m:definedName", NS):
+        name = d.get("name", "")
+        ref = (d.text or "").strip()
+        lsid = d.get("localSheetId")
+        scope = "workbook"
+        if lsid is not None:
+            try:
+                scope = sheets[int(lsid)]["name"]
+            except (ValueError, IndexError):
+                scope = f"sheet#{lsid}"
+        out.append({
+            "name": name,
+            "scope": scope,
+            "refers_to": ref,
+            "broken": "#REF!" in ref,
+            "external": bool(EXT_INDEX_RE.search(ref)) or ("[" in ref and "]" in ref),
+            "hidden": d.get("hidden") == "1",
+            "builtin": name.startswith("_xlnm."),
+        })
+    return out
+
+
+def parse_external_links(zf: zipfile.ZipFile, wb_xml: ET.Element | None, rid_to_target: dict[str, str]) -> list[dict]:
+    """External link targets in workbook order (index as used in formulas: [1], [2] ...)."""
+    links = []
+    if wb_xml is None:
+        return links
     ext_refs = wb_xml.find("m:externalReferences", NS)
     if ext_refs is None:
         return links
     for idx, er in enumerate(ext_refs.findall("m:externalReference", NS), start=1):
         rid = er.get(f"{{{NS['r']}}}id")
-        part = rid_to_target.get(rid, "")
-        part_path = "xl/" + part if not part.startswith("/") else part.lstrip("/")
+        part = rid_to_target.get(rid, "") or ""
+        part_path = ("xl/" + part) if not part.startswith("/") else part.lstrip("/")
         rels_path = part_path.replace("externalLinks/", "externalLinks/_rels/") + ".rels"
-        target = ""
-        kind = "unknown"
-        sheet_names: list[str] = []
+        target, kind, sheet_names = "", "unknown", []
         try:
             rels = ET.fromstring(zf.read(rels_path))
             for r in rels.findall("rel:Relationship", NS):
@@ -112,6 +176,10 @@ def parse_external_links(zf: zipfile.ZipFile) -> list[dict]:
             link_xml = ET.fromstring(zf.read(part_path))
             for sd in link_xml.iter(f"{{{NS['m']}}}sheetName"):
                 sheet_names.append(sd.get("val", ""))
+            if link_xml.find("m:ddeLink", NS) is not None:
+                kind = "ddeLink"
+            if link_xml.find("m:oleLink", NS) is not None:
+                kind = "oleLink"
         except KeyError:
             pass
         links.append({"index": idx, "part": part_path, "target": target, "type": kind, "sheets_referenced": sheet_names})
@@ -126,18 +194,14 @@ def resolve_link_target(target: str, base_dir: Path) -> dict:
     elif t.lower().startswith("file://"):
         t = "\\\\" + t[7:]
     t = t.replace("/", os.sep)
-    candidates = []
     if os.path.isabs(t) or re.match(r"^[A-Za-z]:", t) or t.startswith("\\\\"):
-        candidates.append(Path(t))
+        cand = Path(t)
     else:
-        candidates.append(base_dir / t)
-    for c in candidates:
-        try:
-            if c.exists():
-                return {"resolved": True, "path": str(c)}
-        except OSError:
-            pass
-    return {"resolved": False, "path": str(candidates[0]) if candidates else target}
+        cand = base_dir / t
+    try:
+        return {"resolved": cand.exists(), "path": str(cand)}
+    except OSError:
+        return {"resolved": False, "path": str(cand)}
 
 
 def parse_connections(zf: zipfile.ZipFile) -> list[dict]:
@@ -149,8 +213,8 @@ def parse_connections(zf: zipfile.ZipFile) -> list[dict]:
                 entry = {"name": c.get("name"), "type": c.get("type"), "description": c.get("description", "")}
                 db = c.find("m:dbPr", NS)
                 if db is not None:
-                    entry["connection"] = db.get("connection", "")[:300]
-                    entry["command"] = db.get("command", "")[:300]
+                    entry["connection"] = (db.get("connection", "") or "")[:300]
+                    entry["command"] = (db.get("command", "") or "")[:300]
                 out.append(entry)
         except ET.ParseError:
             pass
@@ -162,28 +226,38 @@ def parse_power_query(zf: zipfile.ZipFile) -> list[str]:
     for n in zf.namelist():
         if n.startswith("customXml/item") and n.endswith(".xml"):
             try:
-                data = zf.read(n)
-                if b"DataMashup" in data:
+                if b"DataMashup" in zf.read(n):
                     names.append(n)
             except KeyError:
                 pass
     return names
 
 
+def parse_table_names(zf: zipfile.ZipFile) -> list[dict]:
+    out = []
+    for n in zf.namelist():
+        if re.match(r"xl/tables/table\d+\.xml$", n):
+            try:
+                t = ET.fromstring(zf.read(n))
+                out.append({"name": t.get("name") or t.get("displayName"), "ref": t.get("ref"), "part": n})
+            except ET.ParseError:
+                pass
+    return out
+
+
 def count_parts(zf: zipfile.ZipFile, prefix: str) -> int:
     return sum(1 for n in zf.namelist() if n.startswith(prefix))
 
 
-def sheet_drawing_counts(zf: zipfile.ZipFile) -> dict[str, dict]:
-    """Map sheet part -> counts of charts / images / pivot tables via rels."""
+def sheet_rel_counts(zf: zipfile.ZipFile) -> dict[str, dict]:
+    """sheet part -> counts of charts / images / pivot tables / tables / comments via rels."""
     out: dict[str, dict] = {}
     names = set(zf.namelist())
     for n in names:
         m = re.match(r"xl/worksheets/_rels/(sheet\d+\.xml)\.rels$", n)
         if not m:
             continue
-        sheet_part = m.group(1)
-        counts = {"drawings": 0, "charts": 0, "images": 0, "pivot_tables": 0, "tables": 0, "comments": 0, "vml": 0}
+        counts = {"charts": 0, "images": 0, "pivot_tables": 0, "tables": 0, "comments": 0}
         try:
             rels = ET.fromstring(zf.read(n))
         except ET.ParseError:
@@ -192,13 +266,11 @@ def sheet_drawing_counts(zf: zipfile.ZipFile) -> dict[str, dict]:
             typ = r.get("Type", "").rsplit("/", 1)[-1]
             target = r.get("Target", "")
             if typ == "drawing":
-                counts["drawings"] += 1
                 dpath = "xl/" + target.replace("../", "")
                 drels = dpath.replace("drawings/", "drawings/_rels/") + ".rels"
                 if drels in names:
                     try:
-                        dr = ET.fromstring(zf.read(drels))
-                        for rr in dr.findall("rel:Relationship", NS):
+                        for rr in ET.fromstring(zf.read(drels)).findall("rel:Relationship", NS):
                             t2 = rr.get("Type", "").rsplit("/", 1)[-1]
                             if t2 == "chart":
                                 counts["charts"] += 1
@@ -212,30 +284,63 @@ def sheet_drawing_counts(zf: zipfile.ZipFile) -> dict[str, dict]:
                 counts["tables"] += 1
             elif typ == "comments":
                 counts["comments"] += 1
-            elif typ == "vmlDrawing":
-                counts["vml"] += 1
-        out[sheet_part] = counts
+        out["xl/worksheets/" + m.group(1)] = counts
     return out
 
 
-def sheet_part_map(zf: zipfile.ZipFile) -> dict[str, str]:
-    """Map sheet name -> sheetN.xml part name."""
-    out = {}
+def scan_sheet_xml(zf: zipfile.ZipFile, part: str, chunk: int = 4 * 1024 * 1024) -> dict:
+    """Chunked byte scan of a sheet part: declared dimension and feature counts, bounded memory."""
+    res = {k: 0 for k in SHEET_XML_COUNTERS}
+    res["declared_dimension"] = ""
+    res["xml_bytes"] = 0
     try:
-        wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
-        wb_rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        info = zf.getinfo(part)
     except KeyError:
-        return out
-    rid_to_target = {r.get("Id"): r.get("Target") for r in wb_rels.findall("rel:Relationship", NS)}
-    sheets = wb_xml.find("m:sheets", NS)
-    if sheets is None:
-        return out
-    for s in sheets.findall("m:sheet", NS):
-        rid = s.get(f"{{{NS['r']}}}id")
-        target = rid_to_target.get(rid, "")
-        out[s.get("name")] = target.rsplit("/", 1)[-1]
-    return out
+        return res
+    res["xml_bytes"] = info.file_size
+    overlap = 64
+    tail = b""
+    first = True
+    with zf.open(part) as fh:
+        while True:
+            data = fh.read(chunk)
+            if not data:
+                break
+            buf = tail + data
+            if first:
+                m = DIMENSION_RE.search(buf)
+                if m:
+                    res["declared_dimension"] = m.group(1).decode()
+                first = False
+            for key, pats in SHEET_XML_COUNTERS.items():
+                for p in pats:
+                    res[key] += buf.count(p)
+            # subtract matches that will be counted again from the overlap region
+            tail = data[-overlap:] if len(data) >= overlap else data
+            if len(buf) > len(data):  # remove matches fully inside the previous tail, which were counted last round
+                prev_tail = buf[: len(buf) - len(data)]
+                for key, pats in SHEET_XML_COUNTERS.items():
+                    for p in pats:
+                        res[key] -= prev_tail.count(p)
+    res["protected"] = res["protected"] > 0
+    res["freeze_panes"] = res["freeze_panes"] > 0
+    return res
 
+
+def dim_rows_cols(dim: str) -> tuple[int, int]:
+    if not dim:
+        return 0, 0
+    last = dim.split(":")[-1]
+    m = re.match(r"([A-Z]+)(\d+)", last)
+    if not m:
+        return 0, 0
+    col = 0
+    for ch in m.group(1):
+        col = col * 26 + (ord(ch) - 64)
+    return int(m.group(2)), col
+
+
+# ----------------------------------------------------------------------------- VBA
 
 def analyse_vba(path: Path) -> dict:
     result = {"present": False, "modules": [], "procedures": 0, "lines": 0, "auto_exec": [], "risk_hits": [], "error": None}
@@ -255,38 +360,31 @@ def analyse_vba(path: Path) -> dict:
             code = code or ""
             lines = [ln for ln in code.splitlines() if ln.strip() and not ln.strip().startswith("Attribute ")]
             procs = [(m.group(1).split()[0], m.group(2)) for m in VBA_PROC_RE.finditer(code)]
-            refs_sheets = sorted(set(re.findall(r"(?:Sheets|Worksheets)\(\"([^\"]+)\"\)", code)))
-            refs_books = sorted(set(re.findall(r"Workbooks(?:\.Open)?\(\"([^\"]+)\"\)", code)))
-            hardcoded_paths = sorted(set(re.findall(r"\"([A-Za-z]:\\[^\"]+|\\\\[^\"]+)\"", code)))
-            risks = sorted(set(m.group(1) for m in VBA_RISK_RE.finditer(code)))
             module = {
                 "module": vba_filename,
                 "lines": len(lines),
                 "procedures": [f"{k} {n}" for k, n in procs],
-                "sheets_referenced": refs_sheets,
-                "workbooks_referenced": refs_books,
-                "hardcoded_paths": hardcoded_paths,
-                "risk_keywords": risks,
+                "sheets_referenced": sorted(set(re.findall(r"(?:Sheets|Worksheets)\(\"([^\"]+)\"\)", code))),
+                "workbooks_referenced": sorted(set(re.findall(r"Workbooks(?:\.Open)?\(\"([^\"]+)\"\)", code))),
+                "hardcoded_paths": sorted(set(re.findall(r"\"([A-Za-z]:\\[^\"]+|\\\\[^\"]+)\"", code))),
+                "risk_keywords": sorted(set(m.group(1) for m in VBA_RISK_RE.finditer(code))),
             }
             result["modules"].append(module)
             result["procedures"] += len(procs)
             result["lines"] += len(lines)
             for _k, n in procs:
-                if n.lower() in ("workbook_open", "auto_open", "workbook_beforeclose", "workbook_beforesave", "auto_close") or n.lower().startswith("worksheet_"):
+                nl = n.lower()
+                if nl in ("workbook_open", "auto_open", "workbook_beforeclose", "workbook_beforesave", "auto_close") or nl.startswith("worksheet_"):
                     result["auto_exec"].append(f"{vba_filename}:{n}")
-            result["risk_hits"].extend(f"{vba_filename}:{r}" for r in risks)
-        # Also record whether project is password protected
-        try:
-            for r in vp.analyze_macros():
-                pass
-        except Exception:
-            pass
+            result["risk_hits"].extend(f"{vba_filename}:{r}" for r in module["risk_keywords"])
     finally:
         vp.close()
     return result
 
 
-def scan_formula(f: str, own_sheet: str, ext_links: list[dict], stats: dict, deps: Counter, ext_use: Counter):
+# ----------------------------------------------------------------------------- cell scans
+
+def scan_formula(f: str, own_sheet: str, stats: dict, deps: Counter, ext_use: Counter):
     fu = f.upper()
     stats["formulas"] += 1
     if any(v in fu for v in VOLATILE):
@@ -295,8 +393,6 @@ def scan_formula(f: str, own_sheet: str, ext_links: list[dict], stats: dict, dep
         stats["lookups"] += 1
     if "#REF!" in fu:
         stats["ref_errors_in_formula"] += 1
-    if fu.startswith("{=") or fu.startswith("{"):
-        stats["array_formulas"] += 1
     ext_idx = [int(m.group(1)) for m in EXT_INDEX_RE.finditer(f)]
     if ext_idx:
         stats["external_link_formulas"] += 1
@@ -308,13 +404,35 @@ def scan_formula(f: str, own_sheet: str, ext_links: list[dict], stats: dict, dep
             continue
         name = name.replace("''", "'")
         if "[" in name and "]" in name:
-            # external workbook reference embedded in sheet ref - counted above
             continue
         if name != own_sheet:
             deps[(own_sheet, name)] += 1
 
 
+def iter_cells(ws):
+    """Stream rows of a read-only sheet without padding to the declared dimension."""
+    try:
+        ws.reset_dimensions()
+    except Exception:
+        pass
+    if hasattr(ws, "_cells_by_row"):
+        return ws._cells_by_row(1, 1, None, None, values_only=False)
+    return ws.iter_rows()
+
+
+def formula_text(v) -> str | None:
+    if isinstance(v, str):
+        return v if v.startswith("=") else None
+    txt = getattr(v, "text", None)  # ArrayFormula
+    if txt is not None:
+        return txt if str(txt).startswith("=") else "=" + str(txt)
+    if v.__class__.__name__ in ("DataTableFormula",):
+        return "=TABLE()"
+    return None
+
+
 def inspect_workbook(path: Path) -> dict:
+    t0 = time.time()
     info: dict = {
         "file": str(path),
         "name": path.name,
@@ -324,17 +442,21 @@ def inspect_workbook(path: Path) -> dict:
         "errors": [],
     }
     if not zipfile.is_zipfile(path):
-        info["errors"].append("Not an OOXML zip (legacy .xls or .xlsb are not supported by this tool)")
+        info["errors"].append("Not an OOXML zip (legacy .xls or .xlsb are not supported by this tool; save as .xlsm)")
         return info
 
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
+        wb_xml, rid_to_target = workbook_xml(zf)
+        sheet_meta = parse_sheets(wb_xml, rid_to_target)
         info["has_vba_project"] = "xl/vbaProject.bin" in names
-        info["external_links"] = parse_external_links(zf)
+        info["external_links"] = parse_external_links(zf, wb_xml, rid_to_target)
         for l in info["external_links"]:
             l.update(resolve_link_target(l["target"], path.parent))
+        info["defined_names"] = parse_defined_names(wb_xml, sheet_meta)
         info["connections"] = parse_connections(zf)
         info["power_query_parts"] = parse_power_query(zf)
+        info["tables"] = parse_table_names(zf)
         info["part_counts"] = {
             "worksheets": count_parts(zf, "xl/worksheets/sheet"),
             "charts": count_parts(zf, "xl/charts/chart"),
@@ -346,103 +468,92 @@ def inspect_workbook(path: Path) -> dict:
             "query_tables": count_parts(zf, "xl/queryTables/"),
             "slicers": count_parts(zf, "xl/slicers/"),
             "external_link_parts": count_parts(zf, "xl/externalLinks/externalLink"),
+            "activex": count_parts(zf, "xl/activeX/"),
+            "embeddings": count_parts(zf, "xl/embeddings/"),
         }
         info["uncompressed_bytes"] = sum(i.file_size for i in zf.infolist())
         largest = sorted(zf.infolist(), key=lambda i: i.file_size, reverse=True)[:8]
         info["largest_parts"] = [{"part": i.filename, "size": human_size(i.file_size)} for i in largest]
-        per_sheet_draw = sheet_drawing_counts(zf)
-        part_map = sheet_part_map(zf)
+        rel_counts = sheet_rel_counts(zf)
+        xml_meta = {s["part"]: scan_sheet_xml(zf, s["part"]) for s in sheet_meta}
 
-    # ---- VBA
     info["vba"] = analyse_vba(path) if info["has_vba_project"] else {"present": False, "modules": [], "procedures": 0, "lines": 0, "auto_exec": [], "risk_hits": [], "error": None}
 
-    # ---- openpyxl pass
-    big = info["size_bytes"] > LARGE_FILE_MB * 1024 * 1024
+    # ---- formula pass (streaming)
+    by_name = {s["name"]: s for s in sheet_meta}
+    sheets: list[dict] = []
+    deps: Counter = Counter()
+    ext_use: Counter = Counter()
+    total: Counter = Counter()
     try:
-        wb = openpyxl.load_workbook(path, read_only=big, data_only=False, keep_vba=False, keep_links=True)
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=False, keep_links=True)
     except Exception as exc:
         info["errors"].append(f"openpyxl could not open workbook: {exc}")
         return info
-
-    # defined names
-    dnames = []
     try:
-        dn_items = list(wb.defined_names.items()) if hasattr(wb.defined_names, "items") else [(d.name, d) for d in wb.defined_names.definedName]
-    except Exception:
-        dn_items = []
-    for nm, d in dn_items:
-        ref = d.attr_text or ""
-        dnames.append({"name": nm, "scope": "workbook", "refers_to": ref, "broken": "#REF!" in ref, "external": bool(EXT_INDEX_RE.search(ref)) or "[" in ref, "hidden": bool(getattr(d, "hidden", False))})
-    # sheet-scoped names
-    if not big:
         for ws in wb.worksheets:
+            meta = by_name.get(ws.title, {"state": getattr(ws, "sheet_state", "visible"), "part": ""})
+            xm = xml_meta.get(meta.get("part"), {})
+            st = {"formulas": 0, "volatile": 0, "lookups": 0, "ref_errors_in_formula": 0, "array_formulas": 0, "external_link_formulas": 0}
+            values = 0
+            last_row = 0
+            last_col = 0
+            samples: list[str] = []
             try:
-                items = list(ws.defined_names.items())
-            except Exception:
-                items = []
-            for nm, d in items:
-                ref = d.attr_text or ""
-                dnames.append({"name": nm, "scope": ws.title, "refers_to": ref, "broken": "#REF!" in ref, "external": bool(EXT_INDEX_RE.search(ref)) or "[" in ref, "hidden": bool(getattr(d, "hidden", False))})
-    info["defined_names"] = dnames
+                for row in iter_cells(ws):
+                    for c in row:
+                        v = getattr(c, "value", None)
+                        if v is None:
+                            continue
+                        values += 1
+                        r_, c_ = getattr(c, "row", 0), getattr(c, "column", 0)
+                        if r_ > last_row:
+                            last_row = r_
+                        if c_ > last_col:
+                            last_col = c_
+                        f = formula_text(v)
+                        if f is None:
+                            continue
+                        if not isinstance(v, str):
+                            st["array_formulas"] += 1
+                        scan_formula(f, ws.title, st, deps, ext_use)
+                        if len(samples) < 5 and ("[" in f or "!" in f):
+                            samples.append(f"{get_column_letter(c_)}{r_}: {f[:120]}")
+            except Exception as exc:
+                info["errors"].append(f"cell scan failed on '{ws.title}': {exc}")
+            decl_rows, decl_cols = dim_rows_cols(xm.get("declared_dimension", ""))
+            used = f"A1:{get_column_letter(last_col)}{last_row}" if last_row and last_col else "(empty)"
+            bloated = decl_rows >= BLOAT_MIN_ROWS and decl_rows > 2 * max(last_row, 1)
+            entry = {
+                "sheet": ws.title,
+                "state": meta.get("state", "visible"),
+                "declared_dimension": xm.get("declared_dimension", ""),
+                "used_range": used,
+                "last_row": last_row,
+                "last_col": last_col,
+                "bloated_dimension": bloated,
+                "xml_bytes": xm.get("xml_bytes", 0),
+                "cells_with_values": values,
+                **st,
+                "merged_ranges": xm.get("merged_ranges", 0),
+                "data_validations": xm.get("data_validations", 0),
+                "conditional_formats": xm.get("conditional_formats", 0),
+                "hyperlinks": xm.get("hyperlinks", 0),
+                "protected": xm.get("protected", False),
+                "freeze_panes": xm.get("freeze_panes", False),
+                "form_controls": xm.get("controls", 0) + xm.get("legacy_drawing", 0),
+                **rel_counts.get(meta.get("part", ""), {"charts": 0, "images": 0, "pivot_tables": 0, "tables": 0, "comments": 0}),
+                "link_formula_samples": samples,
+            }
+            sheets.append(entry)
+            for k, v in st.items():
+                total[k] += v
+            total["cells_with_values"] += values
+        for cs in getattr(wb, "chartsheets", []):
+            sheets.append({"sheet": cs.title, "state": by_name.get(cs.title, {}).get("state", "visible"), "type": "chartsheet"})
+    finally:
+        wb.close()
 
-    sheets = []
-    deps: Counter = Counter()
-    ext_use: Counter = Counter()
-    total = Counter()
-    for ws in wb.worksheets:
-        st = Counter()
-        st_dict = {"formulas": 0, "volatile": 0, "lookups": 0, "ref_errors_in_formula": 0, "array_formulas": 0, "external_link_formulas": 0}
-        values = 0
-        formulas_sample: list[str] = []
-        try:
-            for row in ws.iter_rows():
-                for c in row:
-                    v = c.value
-                    if v is None:
-                        continue
-                    values += 1
-                    if isinstance(v, str) and v.startswith("="):
-                        scan_formula(v, ws.title, info["external_links"], st_dict, deps, ext_use)
-                        if len(formulas_sample) < 5 and ("[" in v or "!" in v):
-                            formulas_sample.append(f"{c.coordinate}: {v[:120]}")
-                    elif hasattr(v, "text"):  # ArrayFormula object
-                        txt = str(getattr(v, "text", ""))
-                        st_dict["array_formulas"] += 1
-                        scan_formula("=" + txt if not txt.startswith("=") else txt, ws.title, info["external_links"], st_dict, deps, ext_use)
-        except Exception as exc:
-            info["errors"].append(f"cell scan failed on '{ws.title}': {exc}")
-        entry = {
-            "sheet": ws.title,
-            "state": getattr(ws, "sheet_state", "visible"),
-            "dims": ws.dimensions if not big else "n/a (read-only)",
-            "max_row": ws.max_row,
-            "max_col": ws.max_column,
-            "cells_with_values": values,
-            **st_dict,
-        }
-        if not big:
-            entry["merged_ranges"] = len(ws.merged_cells.ranges)
-            try:
-                entry["data_validations"] = len(ws.data_validations.dataValidation)
-            except Exception:
-                entry["data_validations"] = 0
-            try:
-                entry["conditional_formats"] = sum(len(r.rules) for r in ws.conditional_formatting)
-            except Exception:
-                entry["conditional_formats"] = 0
-            entry["tables"] = list(ws.tables.keys()) if hasattr(ws, "tables") else []
-            entry["protected"] = bool(ws.protection.sheet)
-            entry["freeze_panes"] = ws.freeze_panes
-        part = part_map.get(ws.title)
-        entry.update({k: v for k, v in per_sheet_draw.get(part, {}).items() if k in ("charts", "images", "pivot_tables", "comments")})
-        entry["link_formula_samples"] = formulas_sample
-        sheets.append(entry)
-        for k, v in st_dict.items():
-            total[k] += v
-        total["cells_with_values"] += values
-    # chartsheets
-    for cs in getattr(wb, "chartsheets", []):
-        sheets.append({"sheet": cs.title, "state": getattr(cs, "sheet_state", "visible"), "type": "chartsheet"})
     info["sheets"] = sheets
     info["totals"] = dict(total)
     info["cross_sheet_dependencies"] = [{"from": a, "to": b, "formulas": n} for (a, b), n in sorted(deps.items(), key=lambda kv: -kv[1])]
@@ -450,24 +561,27 @@ def inspect_workbook(path: Path) -> dict:
     info["dangling_sheet_refs"] = sorted({b for (a, b) in deps if b not in known})
     for l in info["external_links"]:
         l["formulas_using"] = ext_use.get(l["index"], 0)
-    wb.close()
 
-    # ---- cached value error scan (data_only)
-    err = Counter()
+    # ---- cached value error pass (streaming)
+    err: Counter = Counter()
     err_by_sheet: dict[str, Counter] = defaultdict(Counter)
     try:
         wbv = openpyxl.load_workbook(path, read_only=True, data_only=True, keep_links=False)
-        for ws in wbv.worksheets:
-            for row in ws.iter_rows(values_only=True):
-                for v in row:
-                    if isinstance(v, str) and v in ERROR_VALUES:
-                        err[v] += 1
-                        err_by_sheet[ws.title][v] += 1
-        wbv.close()
+        try:
+            for ws in wbv.worksheets:
+                for row in iter_cells(ws):
+                    for c in row:
+                        v = getattr(c, "value", None)
+                        if isinstance(v, str) and v in ERROR_VALUES:
+                            err[v] += 1
+                            err_by_sheet[ws.title][v] += 1
+        finally:
+            wbv.close()
     except Exception as exc:
         info["errors"].append(f"cached value scan failed: {exc}")
     info["cached_errors"] = dict(err)
     info["cached_errors_by_sheet"] = {k: dict(v) for k, v in err_by_sheet.items()}
+    info["scan_seconds"] = round(time.time() - t0, 1)
     return info
 
 
@@ -476,7 +590,7 @@ def inspect_workbook(path: Path) -> dict:
 def md_table(headers: list[str], rows: list[list]) -> str:
     out = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
     for r in rows:
-        out.append("| " + " | ".join(str(x) if x is not None else "" for x in r) + " |")
+        out.append("| " + " | ".join(str(x).replace("|", "\\|") if x is not None else "" for x in r) + " |")
     return "\n".join(out)
 
 
@@ -484,69 +598,71 @@ def render_report(results: list[dict], base: Path) -> str:
     L: list[str] = []
     L.append(f"# Excel workbook inspection\n\nSource: `{base}`  \nGenerated: {datetime.now():%Y-%m-%d %H:%M}\n")
 
-    # summary
     rows = []
     for r in results:
-        if r.get("errors") and "sheets" not in r:
-            rows.append([r["name"], r["size"], "ERROR", "", "", "", "", "", ""])
+        if "sheets" not in r:
+            rows.append([r["name"], r["size"], "ERROR: " + "; ".join(r.get("errors", [])), "", "", "", "", "", ""])
             continue
         hidden = sum(1 for s in r["sheets"] if s.get("state") != "visible")
         dead = sum(1 for l in r["external_links"] if not l.get("resolved"))
+        vba = r["vba"]
         rows.append([
             r["name"], r["size"], len(r["sheets"]), hidden,
             f"{len(r['external_links'])} ({dead} unresolved)",
             r["totals"].get("formulas", 0),
             r["totals"].get("external_link_formulas", 0),
-            f"{r['vba']['procedures']} procs / {r['vba']['lines']} lines" if r["vba"]["present"] else ("bin present, unparsed" if r.get("has_vba_project") else "none"),
+            f"{vba['procedures']} procs / {vba['lines']} lines" if vba["present"] else ("bin present, unparsed" if r.get("has_vba_project") else "none"),
             sum(r["cached_errors"].values()),
         ])
     L.append("## Summary\n")
     L.append(md_table(["Workbook", "Size", "Sheets", "Hidden", "External links", "Formulas", "Ext-link formulas", "VBA", "Cached errors"], rows))
     L.append("")
 
-    # cross-workbook link graph
     L.append("## Cross-workbook link map\n")
-    names = {r["name"].lower(): r["name"] for r in results}
+    names = {r["name"].lower() for r in results}
     graph_rows = []
     for r in results:
         for l in r.get("external_links", []):
             tgt = unquote(l["target"])
             tgt_name = tgt.replace("\\", "/").rsplit("/", 1)[-1]
-            inset = "yes" if tgt_name.lower() in names else "NO (outside this set)"
-            graph_rows.append([r["name"], f"[{l['index']}]", tgt[:110], "ok" if l.get("resolved") else "MISSING", inset, l.get("formulas_using", 0), ", ".join(l["sheets_referenced"][:6])])
-    L.append(md_table(["From", "Idx", "Target", "On disk", "In this set", "Formulas", "Sheets referenced"], graph_rows) if graph_rows else "_No external links found._")
+            graph_rows.append([r["name"], f"[{l['index']}]", l.get("type", ""), tgt[:110], "ok" if l.get("resolved") else "MISSING", "yes" if tgt_name.lower() in names else "no", l.get("formulas_using", 0), ", ".join(l["sheets_referenced"][:6])])
+    L.append(md_table(["From", "Idx", "Type", "Target", "On disk", "In this set", "Formulas", "Sheets referenced"], graph_rows) if graph_rows else "_No external links found._")
     L.append("")
 
     for r in results:
         L.append(f"\n---\n\n## {r['name']}\n")
-        L.append(f"- Size {r['size']} on disk, {human_size(r.get('uncompressed_bytes', 0))} uncompressed. Modified {r['modified']}.")
-        if r.get("errors"):
-            for e in r["errors"]:
-                L.append(f"- **Error:** {e}")
+        L.append(f"- Size {r['size']} on disk, {human_size(r.get('uncompressed_bytes', 0))} uncompressed. Modified {r['modified']}. Scan {r.get('scan_seconds', '?')} s.")
+        for e in r.get("errors", []):
+            L.append(f"- **Error:** {e}")
         if "sheets" not in r:
             continue
         pc = r["part_counts"]
-        L.append(f"- Parts: {pc['worksheets']} worksheets, {pc['charts']} charts, {pc['pivot_tables']} pivot tables ({pc['pivot_caches']} caches), {pc['tables']} tables, {pc['images']} media files, {pc['query_tables']} query tables, {pc['slicers']} slicers.")
+        L.append(f"- Parts: {pc['worksheets']} worksheets, {pc['charts']} charts, {pc['pivot_tables']} pivot tables ({pc['pivot_caches']} caches), {pc['tables']} tables, {pc['images']} media files, {pc['query_tables']} query tables, {pc['slicers']} slicers, {pc['activex']} ActiveX, {pc['embeddings']} embeddings.")
         L.append(f"- Data connections: {len(r['connections'])}; Power Query parts: {len(r['power_query_parts'])}.")
-        L.append(f"- Largest parts: " + ", ".join(f"{p['part'].split('/')[-1]} {p['size']}" for p in r["largest_parts"][:5]))
+        L.append("- Largest parts: " + ", ".join(f"{p['part'].split('/')[-1]} {p['size']}" for p in r["largest_parts"][:5]))
         L.append("")
 
-        # sheets
         L.append("### Sheets\n")
         srows = []
         for s in r["sheets"]:
             if s.get("type") == "chartsheet":
-                srows.append([s["sheet"], s["state"], "chartsheet", "", "", "", "", "", "", "", ""])
+                srows.append([s["sheet"], s["state"], "chartsheet", "", "", "", "", "", "", "", "", ""])
                 continue
+            used = s["used_range"] + (" BLOAT" if s["bloated_dimension"] else "")
             srows.append([
-                s["sheet"], s["state"], s.get("dims", ""), s["cells_with_values"], s["formulas"],
-                s["external_link_formulas"], s["volatile"], s["lookups"], s.get("data_validations", ""),
-                s.get("conditional_formats", ""), f"{s.get('charts', 0)}c/{s.get('pivot_tables', 0)}p/{s.get('images', 0)}i",
+                s["sheet"], s["state"], s["declared_dimension"], used, s["cells_with_values"], s["formulas"],
+                s["external_link_formulas"], s["volatile"], s["lookups"], s["data_validations"],
+                s["conditional_formats"], f"{s['charts']}c/{s['pivot_tables']}p/{s['images']}i/{s['tables']}t",
             ])
-        L.append(md_table(["Sheet", "State", "Used range", "Values", "Formulas", "Ext-link", "Volatile", "Lookups", "DV", "CF", "Charts/Pivots/Imgs"], srows))
+        L.append(md_table(["Sheet", "State", "Declared", "Used", "Values", "Formulas", "Ext-link", "Volatile", "Lookups", "DV", "CF", "Charts/Pivots/Imgs/Tables"], srows))
+        bloat = [s["sheet"] for s in r["sheets"] if s.get("bloated_dimension")]
+        if bloat:
+            L.append(f"\nDeclared range far larger than real content (dead rows, slows the file): {', '.join(bloat)}")
+        prot = [s["sheet"] for s in r["sheets"] if s.get("protected")]
+        if prot:
+            L.append(f"\nProtected sheets: {', '.join(prot)}")
         L.append("")
 
-        # dependencies
         L.append("### Cross-sheet dependencies (formula count, top 40)\n")
         deps = r["cross_sheet_dependencies"][:40]
         L.append(md_table(["From sheet", "Reads from", "Formulas"], [[d["from"], d["to"], d["formulas"]] for d in deps]) if deps else "_None._")
@@ -554,17 +670,15 @@ def render_report(results: list[dict], base: Path) -> str:
             L.append(f"\n**Dangling sheet references (sheet no longer exists):** {', '.join(r['dangling_sheet_refs'])}")
         L.append("")
 
-        # defined names
         dn = r["defined_names"]
         broken = [d for d in dn if d["broken"]]
         ext = [d for d in dn if d["external"] and not d["broken"]]
-        L.append(f"### Defined names: {len(dn)} total, {len(broken)} broken (#REF!), {len(ext)} pointing to external workbooks\n")
+        L.append(f"### Defined names: {len(dn)} total, {len(broken)} broken (#REF!), {len(ext)} pointing to external workbooks, {sum(1 for d in dn if d['hidden'])} hidden\n")
         show = broken + ext
         if show:
             L.append(md_table(["Name", "Scope", "Refers to", "Status"], [[d["name"], d["scope"], d["refers_to"][:100], "BROKEN" if d["broken"] else "external"] for d in show[:60]]))
         L.append("")
 
-        # VBA
         v = r["vba"]
         L.append("### VBA\n")
         if not v["present"]:
@@ -584,19 +698,21 @@ def render_report(results: list[dict], base: Path) -> str:
             L.append(md_table(["Module", "Lines", "Procedures", "Sheets referenced", "Hard-coded paths"], [[m["module"], m["lines"], ", ".join(m["procedures"])[:200], ", ".join(m["sheets_referenced"])[:120], ", ".join(m["hardcoded_paths"])[:120]] for m in v["modules"]]))
         L.append("")
 
-        # connections
         if r["connections"]:
             L.append("### Data connections\n")
             L.append(md_table(["Name", "Type", "Connection", "Command"], [[c.get("name"), c.get("type"), c.get("connection", "")[:100], c.get("command", "")[:100]] for c in r["connections"]]))
             L.append("")
 
-        # cached errors
+        if r["tables"]:
+            L.append("### Excel tables (ListObjects)\n")
+            L.append(", ".join(f"{t['name']} ({t['ref']})" for t in r["tables"][:40]))
+            L.append("")
+
         if r["cached_errors"]:
             L.append("### Cached error values\n")
             L.append(md_table(["Sheet"] + list(ERROR_VALUES), [[sh] + [cnt.get(e, 0) for e in ERROR_VALUES] for sh, cnt in sorted(r["cached_errors_by_sheet"].items(), key=lambda kv: -sum(kv[1].values()))[:30]]))
             L.append("")
 
-        # link formula samples
         samples = [(s["sheet"], f) for s in r["sheets"] for f in s.get("link_formula_samples", [])]
         if samples:
             L.append("### Sample cross-reference formulas\n")
@@ -627,17 +743,17 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     results = []
     for f in files:
-        print(f"inspecting {f.name} ...", flush=True)
+        print(f"inspecting {f.name} ({human_size(f.stat().st_size)}) ...", flush=True)
         try:
             r = inspect_workbook(f)
         except Exception as exc:
             r = {"file": str(f), "name": f.name, "size": human_size(f.stat().st_size), "size_bytes": f.stat().st_size, "modified": "", "errors": [f"unhandled: {exc!r}"]}
         results.append(r)
         (out / (f.stem + ".json")).write_text(json.dumps(r, indent=2, default=str), encoding="utf-8")
+        print(f"  done in {r.get('scan_seconds', '?')} s", flush=True)
 
     base = files[0].parent if len({f.parent for f in files}) == 1 else Path(os.path.commonpath([str(f) for f in files]))
-    report = render_report(results, base)
-    (out / "inspection_report.md").write_text(report, encoding="utf-8")
+    (out / "inspection_report.md").write_text(render_report(results, base), encoding="utf-8")
     print(f"\nreport written to {out / 'inspection_report.md'}")
     if not HAVE_OLEVBA:
         print("note: install oletools for VBA analysis:  pip install oletools")
