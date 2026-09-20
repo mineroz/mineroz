@@ -1,6 +1,6 @@
 {
   "system": "Mako Production System",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "site": {
     "name": "Mako Gold Mine",
     "company": "Petowal Mining Company S.A.",
@@ -67,10 +67,10 @@
       "spare_rows": 5,
       "columns": [
         {"name": "Stockpile", "type": "text", "desc": "Stockpile name; must match a Source and a Destination"},
-        {"name": "Opening_t", "type": "number", "unit": "t", "desc": "Surveyed tonnes at the start of the year"},
-        {"name": "Opening_gpt", "type": "number", "unit": "g/t", "desc": "Grade of the opening balance"},
-        {"name": "Plant_Feed", "type": "list", "list": "Yes_No", "desc": "Y for exactly one stockpile: the plant draws its feed from it (milled tonnes less direct tip are deducted)"},
-        {"name": "Survey_Date", "type": "date", "desc": "Date of the opening survey"}
+        {"name": "Opening_t", "type": "number", "unit": "t", "min": 0, "max": 5000000, "desc": "Surveyed tonnes at the start of Survey_Date (1 January if blank); movements before that day are not part of the balance"},
+        {"name": "Opening_gpt", "type": "number", "unit": "g/t", "min": 0, "max": 50, "desc": "Grade of the opening balance"},
+        {"name": "Plant_Feed", "type": "list", "list": "Yes_No", "desc": "Y for exactly one stockpile: the plant draws its feed from it (milled tonnes less direct tip are deducted, so its balance includes ore tipped to the crusher but not yet milled)"},
+        {"name": "Survey_Date", "type": "date", "desc": "Day the opening balance applies to (balance at the start of that day; blank = 1 January). After a re-survey enter the new tonnes, grade and date here"}
       ],
       "rows": [
         ["ROM Pad", 0, 0, "Y", null],
@@ -111,13 +111,13 @@
         {"name": "Raw_Water_m3", "label": "Raw water", "unit": "m3", "type": "number", "min": 0, "max": 100000, "desc": "Raw water drawn"},
         {"name": "GIC_oz", "label": "Gold in circuit", "unit": "oz", "type": "number", "min": 0, "max": 50000, "desc": "Gold in circuit at end of day (point value, not additive)"},
         {"name": "Comments", "label": "Comments", "type": "text", "desc": "Short note; use the Commentary sheet for the report narrative"},
-        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "IF(OR({Milled_t}=\"\",{Head_Grade_gpt}=\"\"),\"\",{Milled_t}*{Head_Grade_gpt}/{TROY})", "sql": "milled_t * head_grade_gpt / 31.1035", "desc": "Milled t x head grade / 31.1035; blank until the head grade is entered"},
-        {"name": "Tails_oz", "label": "Gold lost to tails", "unit": "oz", "type": "number", "calc": "IF(OR({Milled_t}=\"\",{Tails_Grade_gpt}=\"\"),\"\",{Milled_t}*{Tails_Grade_gpt}/{TROY})", "sql": "milled_t * tails_grade_gpt / 31.1035", "desc": "Milled t x tails grade / 31.1035; blank until the tails grade is entered"},
-        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "IF(OR({Milled_t}=\"\",{Head_Grade_gpt}=\"\",{Tails_Grade_gpt}=\"\"),\"\",{Feed_oz}-{Tails_oz})", "sql": "milled_t * (head_grade_gpt - tails_grade_gpt) / 31.1035", "desc": "Feed oz minus tails oz; blank until both grades are entered"},
+        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "IF(OR({Milled_t}=\"\",{Head_Grade_gpt}=\"\"),\"\",{Milled_t}*{Head_Grade_gpt}/{TROY})", "sql": "milled_t * head_grade_gpt / {TROY}", "desc": "Milled t x head grade / 31.1035; blank until the head grade is entered"},
+        {"name": "Tails_oz", "label": "Gold lost to tails", "unit": "oz", "type": "number", "calc": "IF(OR({Milled_t}=\"\",{Tails_Grade_gpt}=\"\"),\"\",{Milled_t}*{Tails_Grade_gpt}/{TROY})", "sql": "milled_t * tails_grade_gpt / {TROY}", "desc": "Milled t x tails grade / 31.1035; blank until the tails grade is entered"},
+        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "IF(OR({Milled_t}=\"\",{Head_Grade_gpt}=\"\",{Tails_Grade_gpt}=\"\"),\"\",{Feed_oz}-{Tails_oz})", "sql": "milled_t * (head_grade_gpt - tails_grade_gpt) / {TROY}", "desc": "Feed oz minus tails oz; blank until both grades are entered"},
         {"name": "Recovery_pct", "label": "Recovery", "unit": "%", "type": "pct", "calc": "IF(AND(ISNUMBER({Recovered_oz}),{Feed_oz}>0),{Recovered_oz}/{Feed_oz},\"\")", "sql": "CASE WHEN head_grade_gpt > 0 THEN 1 - tails_grade_gpt / head_grade_gpt END", "desc": "1 minus tails grade over head grade; blank until both grades are entered"},
         {"name": "Throughput_tph", "label": "Throughput", "unit": "t/h", "type": "number", "calc": "IF(AND({Milled_t}<>\"\",{Mill_Run_h}>0),{Milled_t}/{Mill_Run_h},\"\")", "sql": "CASE WHEN mill_run_h > 0 THEN milled_t / mill_run_h END", "desc": "Milled t per running hour"},
-        {"name": "Availability_pct", "label": "Mill availability", "unit": "%", "type": "pct", "calc": "IF(AND({Mill_Run_h}=\"\",{Mill_Planned_Maint_h}=\"\",{Mill_Unplanned_Down_h}=\"\"),\"\",(24-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})/24)", "sql": "CASE WHEN COALESCE(mill_run_h, mill_planned_maint_h, mill_unplanned_down_h) IS NOT NULL THEN (24 - COALESCE(mill_planned_maint_h, 0) - COALESCE(mill_unplanned_down_h, 0)) / 24.0 END", "desc": "(24 h minus planned and unplanned downtime) / 24 h; blank only when no mill hours are entered"},
-        {"name": "Utilisation_pct", "label": "Mill utilisation", "unit": "%", "type": "pct", "calc": "IF(AND(NOT(AND({Mill_Run_h}=\"\",{Mill_Planned_Maint_h}=\"\",{Mill_Unplanned_Down_h}=\"\")),(24-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})>0),{Mill_Run_h}/(24-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h}),\"\")", "sql": "CASE WHEN COALESCE(mill_run_h, mill_planned_maint_h, mill_unplanned_down_h) IS NOT NULL AND (24 - COALESCE(mill_planned_maint_h, 0) - COALESCE(mill_unplanned_down_h, 0)) > 0 THEN COALESCE(mill_run_h, 0) / (24 - COALESCE(mill_planned_maint_h, 0) - COALESCE(mill_unplanned_down_h, 0)) END", "desc": "Run hours over available hours; blank only when no mill hours are entered"}
+        {"name": "Availability_pct", "label": "Mill availability", "unit": "%", "type": "pct", "calc": "IF(AND({Mill_Run_h}=\"\",{Mill_Planned_Maint_h}=\"\",{Mill_Unplanned_Down_h}=\"\"),\"\",({HOURS_PER_DAY}-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})/{HOURS_PER_DAY})", "sql": "CASE WHEN COALESCE(mill_run_h, mill_planned_maint_h, mill_unplanned_down_h) IS NOT NULL THEN (24 - COALESCE(mill_planned_maint_h, 0) - COALESCE(mill_unplanned_down_h, 0)) / 24.0 END", "desc": "(24 h minus planned and unplanned downtime) / 24 h; blank only when no mill hours are entered"},
+        {"name": "Utilisation_pct", "label": "Mill utilisation", "unit": "%", "type": "pct", "calc": "IF(AND(NOT(AND({Mill_Run_h}=\"\",{Mill_Planned_Maint_h}=\"\",{Mill_Unplanned_Down_h}=\"\")),({HOURS_PER_DAY}-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})>0),{Mill_Run_h}/({HOURS_PER_DAY}-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h}),\"\")", "sql": "CASE WHEN COALESCE(mill_run_h, mill_planned_maint_h, mill_unplanned_down_h) IS NOT NULL AND (24 - COALESCE(mill_planned_maint_h, 0) - COALESCE(mill_unplanned_down_h, 0)) > 0 THEN COALESCE(mill_run_h, 0) / (24 - COALESCE(mill_planned_maint_h, 0) - COALESCE(mill_unplanned_down_h, 0)) END", "desc": "Run hours over available hours; blank only when no mill hours are entered"}
       ]
     },
     {
@@ -126,6 +126,7 @@
       "title": "Material movements, one row per source, material and destination per day (or per shift)",
       "owner": "Mining (dispatch / production engineer)",
       "rows": 5000,
+      "unique": [["Date", "Shift", "Source", "Material", "Destination"]],
       "fields": [
         {"name": "Date", "label": "Date", "type": "date", "required": true, "desc": "Production day"},
         {"name": "Shift", "label": "Shift", "type": "list", "list": "Shift", "desc": "Optional; leave blank for a daily total"},
@@ -140,8 +141,8 @@
         {"name": "Source_Type", "label": "Source type", "type": "text", "calc": "IF({Source}=\"\",\"\",IFERROR(INDEX(tblSources[Type],MATCH({Source},tblSources[Source],0)),\"?\"))", "values_from": "Source_Type", "warn_when": "{Source_Type}=\"?\"", "desc": "Pit or Stockpile, looked up from Lists; ? when the source is not in tblSources (row is highlighted and excluded from every KPI)"},
         {"name": "Dest_Type", "label": "Destination type", "type": "text", "calc": "IF({Destination}=\"\",\"\",IFERROR(INDEX(tblDestinations[Type],MATCH({Destination},tblDestinations[Destination],0)),\"?\"))", "values_from": "Destination_Type", "warn_when": "{Dest_Type}=\"?\"", "desc": "Stockpile, Plant or Waste, looked up from Lists; ? when the destination is not in tblDestinations (row is highlighted)"},
         {"name": "Is_Ore", "label": "Ore flag", "type": "int", "calc": "IF({Material}=\"\",\"\",IF(LEFT({Material},3)=\"Ore\",1,0))", "sql": "CASE WHEN material LIKE 'Ore%' THEN 1 ELSE 0 END", "desc": "1 when Material starts with Ore"},
-        {"name": "Contained_oz", "label": "Contained gold", "unit": "oz", "type": "number", "calc": "IF(OR({Tonnes_t}=\"\",{Grade_gpt}=\"\"),0,{Tonnes_t}*{Grade_gpt}/{TROY})", "sql": "tonnes_t * COALESCE(grade_gpt, 0) / 31.1035", "desc": "Tonnes x grade / 31.1035, any material with a grade"},
-        {"name": "Ore_oz", "label": "Ore gold", "unit": "oz", "type": "number", "calc": "IF({Is_Ore}=1,{Contained_oz},0)", "sql": "CASE WHEN material LIKE 'Ore%' THEN tonnes_t * COALESCE(grade_gpt, 0) / 31.1035 ELSE 0 END", "desc": "Contained oz for ore rows only"}
+        {"name": "Contained_oz", "label": "Contained gold", "unit": "oz", "type": "number", "calc": "IF(OR({Tonnes_t}=\"\",{Grade_gpt}=\"\"),0,{Tonnes_t}*{Grade_gpt}/{TROY})", "sql": "tonnes_t * COALESCE(grade_gpt, 0) / {TROY}", "desc": "Tonnes x grade / 31.1035, any material with a grade"},
+        {"name": "Ore_oz", "label": "Ore gold", "unit": "oz", "type": "number", "calc": "IF({Is_Ore}=1,{Contained_oz},0)", "sql": "CASE WHEN material LIKE 'Ore%' THEN tonnes_t * COALESCE(grade_gpt, 0) / {TROY} ELSE 0 END", "desc": "Contained oz for ore rows only"}
       ]
     },
     {
@@ -153,6 +154,7 @@
       "fields": [
         {"name": "Date", "label": "Date", "type": "date", "key": true},
         {"name": "Drill_m", "label": "Drilled", "unit": "m", "type": "number", "min": 0, "max": 20000, "desc": "Production drill metres"},
+        {"name": "GC_Drill_m", "label": "Grade control drilled", "unit": "m", "type": "number", "min": 0, "max": 5000, "desc": "Grade control RC drill metres"},
         {"name": "Blast_t", "label": "Blasted", "unit": "t", "type": "number", "min": 0, "max": 500000, "desc": "Tonnes blasted"},
         {"name": "Explosives_kg", "label": "Explosives", "unit": "kg", "type": "number", "min": 0, "max": 200000, "desc": "Explosives consumed"},
         {"name": "Diesel_L", "label": "Diesel", "unit": "L", "type": "number", "min": 0, "max": 200000, "desc": "Mining fleet diesel"},
@@ -167,14 +169,15 @@
       "title": "Mining fleet time model, one row per equipment class per day",
       "owner": "Mining (dispatch / maintenance planner)",
       "rows": 3000,
+      "unique": [["Date", "Equipment_Class"]],
       "fields": [
         {"name": "Date", "label": "Date", "type": "date", "required": true},
         {"name": "Equipment_Class", "label": "Equipment class", "type": "list", "list": "Equipment_Class", "required": true},
         {"name": "Units", "label": "Units in fleet", "type": "int", "min": 0, "max": 200, "required": true, "desc": "Number of machines of this class on site"},
         {"name": "Down_h", "label": "Down hours", "unit": "h", "type": "number", "min": 0, "max": 4800, "desc": "Sum of maintenance and breakdown hours across the class"},
-        {"name": "Operating_h", "label": "Operating hours", "unit": "h", "type": "number", "min": 0, "max": 4800, "desc": "Sum of engine or productive hours across the class"},
+        {"name": "Operating_h", "label": "Operating hours", "unit": "h", "type": "number", "min": 0, "max": 4800, "desc": "Sum of SMU engine hours across the class (one basis for every class)"},
         {"name": "Comments", "label": "Comments", "type": "text"},
-        {"name": "Calendar_h", "label": "Calendar hours", "unit": "h", "type": "number", "calc": "IF({Units}=\"\",\"\",{Units}*24)", "sql": "units * 24", "desc": "Units x 24"},
+        {"name": "Calendar_h", "label": "Calendar hours", "unit": "h", "type": "number", "calc": "IF({Units}=\"\",\"\",{Units}*{HOURS_PER_DAY})", "sql": "units * 24", "desc": "Units x 24"},
         {"name": "Available_h", "label": "Available hours", "unit": "h", "type": "number", "calc": "IF({Units}=\"\",\"\",{Calendar_h}-{Down_h})", "sql": "units * 24 - COALESCE(down_h, 0)", "desc": "Calendar minus down"},
         {"name": "Availability_pct", "label": "Availability", "unit": "%", "type": "pct", "calc": "IF(AND({Units}<>\"\",{Calendar_h}>0),{Available_h}/{Calendar_h},\"\")", "sql": "CASE WHEN units > 0 THEN (units * 24 - COALESCE(down_h, 0)) / (units * 24.0) END", "desc": "Available over calendar"},
         {"name": "Utilisation_pct", "label": "Utilisation", "unit": "%", "type": "pct", "calc": "IF(AND({Units}<>\"\",{Available_h}>0),{Operating_h}/{Available_h},\"\")", "sql": "CASE WHEN (units * 24 - COALESCE(down_h, 0)) > 0 THEN COALESCE(operating_h, 0) / (units * 24 - COALESCE(down_h, 0)) END", "desc": "Operating over available"}
@@ -205,7 +208,7 @@
         {"name": "Inspections", "label": "Inspections and audits", "type": "int", "min": 0, "max": 500},
         {"name": "Comments", "label": "Comments", "type": "text"},
         {"name": "Hours_Total", "label": "Hours worked, total", "unit": "h", "type": "number", "calc": "IF(AND({Hours_Employees}=\"\",{Hours_Contractors}=\"\"),\"\",N({Hours_Employees})+N({Hours_Contractors}))", "sql": "COALESCE(hours_employees, 0) + COALESCE(hours_contractors, 0)"},
-        {"name": "Recordables", "label": "Recordable injuries", "type": "int", "calc": "N({Fatality})+N({LTI})+N({RWI})+N({MTI})", "sql": "COALESCE(fatality,0) + COALESCE(lti,0) + COALESCE(rwi,0) + COALESCE(mti,0)", "desc": "Fatalities + LTI + RWI + MTI"}
+        {"name": "Recordables", "label": "Recordable injuries", "type": "int", "calc": "IF(AND({Fatality}=\"\",{LTI}=\"\",{RWI}=\"\",{MTI}=\"\"),\"\",N({Fatality})+N({LTI})+N({RWI})+N({MTI}))", "sql": "COALESCE(fatality,0) + COALESCE(lti,0) + COALESCE(rwi,0) + COALESCE(mti,0)", "desc": "Fatalities + LTI + RWI + MTI"}
       ]
     },
     {
@@ -257,10 +260,10 @@
         {"name": "Drill_m", "label": "Drilled", "unit": "m", "type": "number", "min": 0, "max": 500000},
         {"name": "Diesel_L", "label": "Mining diesel", "unit": "L", "type": "number", "min": 0, "max": 10000000},
         {"name": "Days", "label": "Days in month", "type": "int", "calc": "DAY(EOMONTH({Month},0))", "sql": "EXTRACT(DAY FROM (date_trunc('month', month::timestamp) + INTERVAL '1 month - 1 day'))::integer", "sql_postgres": "EXTRACT(DAY FROM (date_trunc('month', month::timestamp) + INTERVAL '1 month - 1 day'))::integer", "sql_sqlite": "CAST(strftime('%d', date(month, 'start of month', '+1 month', '-1 day')) AS INTEGER)"},
-        {"name": "Ore_oz", "label": "Ore gold mined", "unit": "oz", "type": "number", "calc": "N({Ore_Mined_t})*N({Ore_Grade_gpt})/{TROY}", "sql": "COALESCE(ore_mined_t,0) * COALESCE(ore_grade_gpt,0) / 31.1035"},
+        {"name": "Ore_oz", "label": "Ore gold mined", "unit": "oz", "type": "number", "calc": "N({Ore_Mined_t})*N({Ore_Grade_gpt})/{TROY}", "sql": "COALESCE(ore_mined_t,0) * COALESCE(ore_grade_gpt,0) / {TROY}"},
         {"name": "TMM_t", "label": "Total material moved", "unit": "t", "type": "number", "calc": "N({Ore_Mined_t})+N({Waste_t})", "sql": "COALESCE(ore_mined_t,0) + COALESCE(waste_t,0)"},
-        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "N({Milled_t})*N({Head_Grade_gpt})/{TROY}", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / 31.1035"},
-        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "{Feed_oz}*N({Recovery_pct})", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / 31.1035 * COALESCE(recovery_pct,0)"}
+        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "N({Milled_t})*N({Head_Grade_gpt})/{TROY}", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / {TROY}"},
+        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "{Feed_oz}*N({Recovery_pct})", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / {TROY} * COALESCE(recovery_pct,0)"}
       ]
     },
     {

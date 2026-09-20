@@ -22,6 +22,7 @@ import argparse
 import calendar
 import json
 import random
+import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -34,6 +35,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Si
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.pagebreak import Break
 from openpyxl.worksheet.properties import PageSetupProperties
 from openpyxl.worksheet.table import Table, TableFormula, TableStyleInfo
 
@@ -57,6 +59,12 @@ FMT = {
     "m3/t": "0.00", "ratio": "0.00", "rate": "0.00", "days": "0", "int": "0", "date": "dd-mmm-yyyy", "text": "@", "number": "#,##0.00",
 }
 TROY = "cfg_TroyOz"
+# schema constants exposed as named Config cells; {NAME} placeholders in table calcs and KPI formulas resolve to the name
+CONSTANTS = {"TROY_OZ_G": ("cfg_TroyOz", "Troy ounce (g)"),
+             "HOURS_PER_DAY": ("cfg_HoursPerDay", "Hours per day (fleet and mill calendar hours)"),
+             "RATE_BASIS_HOURS": ("cfg_RateBasisHours", "Injury rate basis, hours (TRIFR and LTIFR are injuries per this many hours)")}
+PLACEHOLDERS = {"TROY": TROY, **{k: v[0] for k, v in CONSTANTS.items()}}
+DEFAULT_DATE_FORMULA = "=MAX(cfg_YearStart,MIN(TODAY()-1,cfg_YearEnd,IF(N(cfg_LastDataDate)>0,cfg_LastDataDate,cfg_YearEnd)))"
 
 thin = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -68,6 +76,18 @@ def font(bold=False, color="000000", size=10, italic=False):
 
 def fill(hex_):
     return PatternFill("solid", start_color=hex_, end_color=hex_)
+
+
+def const_subst(expr: str) -> str:
+    """Replace {TROY}, {HOURS_PER_DAY}, {RATE_BASIS_HOURS} with their Config names."""
+    for k, v in PLACEHOLDERS.items():
+        expr = expr.replace("{" + k + "}", v)
+    return expr
+
+
+def num_text(v) -> str:
+    """Number as Excel formula text: 5000000 not 5000000.0."""
+    return str(int(v)) if float(v).is_integer() else str(v)
 
 
 def xl_date_text(expr: str) -> str:
@@ -112,6 +132,7 @@ KPIS = [
     K("Moved_Total_t", "Total tonnes moved (all movement rows)", "t", "sum", day=sumifs("tblMovement", "Tonnes_t")),
     K("Unclassified_t", "Movements with unknown source type (check)", "t", "sum", day="{Moved_Total_t}-{TMM_t}-{Rehandle_t}"),
     K("Drill_m", "Drilled", "m", "sum", day=sumifs("tblMiningDaily", "Drill_m"), budget="Drill_m"),
+    K("GC_Drill_m", "Grade control drilled", "m", "sum", day=sumifs("tblMiningDaily", "GC_Drill_m")),
     K("Blast_t", "Blasted", "t", "sum", day=sumifs("tblMiningDaily", "Blast_t")),
     K("Explosives_kg", "Explosives", "kg", "sum", day=sumifs("tblMiningDaily", "Explosives_kg")),
     K("Powder_Factor_kgpt", "Powder factor", "kg/t", "ratio", num="{Explosives_kg}", den="{Blast_t}"),
@@ -127,6 +148,8 @@ KPIS = [
     K("Trk_Operating_h", "Truck operating hours", "h", "sum", day=sumifs("tblFleet", "Operating_h", ("Equipment_Class", '"Haul Truck"'))),
     K("Trk_Availability_pct", "Truck availability", "%", "ratio", num="{Trk_Available_h}", den="{Trk_Calendar_h}"),
     K("Trk_Utilisation_pct", "Truck utilisation", "%", "ratio", num="{Trk_Operating_h}", den="{Trk_Available_h}"),
+    K("Exc_Productivity_tph", "Excavator productivity (TMM + rehandle)", "t/h", "ratio", num="{TMM_t}+{Rehandle_t}", den="{Exc_Operating_h}"),
+    K("Trk_Productivity_tph", "Truck productivity (TMM + rehandle)", "t/h", "ratio", num="{TMM_t}+{Rehandle_t}", den="{Trk_Operating_h}"),
     # ---- processing
     K("Crushed_t", "Crushed", "t", "sum", day=sumifs("tblPlant", "Crushed_t")),
     K("Milled_t", "Milled", "t", "sum", day=sumifs("tblPlant", "Milled_t"), budget="Milled_t"),
@@ -144,13 +167,14 @@ KPIS = [
     K("Tails_Grade_gpt", "Tails grade", "g/t", "ratio", num="{Tails_oz}*" + TROY, den="{Milled_Tails_Graded_t}"),
     K("Recovery_pct", "Recovery", "%", "ratio", num="{Recovered_oz}", den="{Feed_Recon_oz}"),
     K("Gravity_Gold_oz", "Gravity gold", "oz", "sum", day=sumifs("tblPlant", "Gravity_Gold_oz")),
+    K("Gravity_Share_pct", "Gravity share of gold recovered", "%", "ratio", num="{Gravity_Gold_oz}", den="{Recovered_oz}"),
     K("Gold_Poured_oz", "Gold poured", "oz", "sum", day=sumifs("tblPlant", "Gold_Poured_oz"), budget="Gold_Poured_oz"),
     K("Mill_Run_h", "Mill run hours", "h", "sum", day=sumifs("tblPlant", "Mill_Run_h")),
     K("Mill_Planned_Maint_h", "Mill planned maintenance", "h", "sum", day=sumifs("tblPlant", "Mill_Planned_Maint_h")),
     K("Mill_Unplanned_Down_h", "Mill unplanned downtime", "h", "sum", day=sumifs("tblPlant", "Mill_Unplanned_Down_h")),
     K("Mill_Calendar_h", "Mill calendar hours (days with any mill hours entered)", "h", "sum",
       day='IF(COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Run_h],"<>")+COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Planned_Maint_h],"<>")'
-          '+COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Unplanned_Down_h],"<>")>0,24,0)'),
+          '+COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Unplanned_Down_h],"<>")>0,{HOURS_PER_DAY},0)'),
     K("Crusher_Run_h", "Crusher run hours", "h", "sum", day=sumifs("tblPlant", "Crusher_Run_h")),
     K("Throughput_tph", "Mill throughput", "t/h", "ratio", num="{Milled_Timed_t}", den="{Mill_Run_h}"),
     K("Mill_Availability_pct", "Mill availability", "%", "ratio", num="{Mill_Calendar_h}-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h}", den="{Mill_Calendar_h}"),
@@ -192,12 +216,12 @@ KPIS = [
       day='IFERROR((SUMIFS(tblSafety[Recordables],tblSafety[Date],">="&EDATE({ms},-12),tblSafety[Date],"<="&{d})'
           '+SUMIFS(tblSafetyHistory[Recordables],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))'
           '/(SUMIFS(tblSafety[Hours_Total],tblSafety[Date],">="&EDATE({ms},-12),tblSafety[Date],"<="&{d})'
-          '+SUMIFS(tblSafetyHistory[Hours_Total],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))*1000000,"")'),
+          '+SUMIFS(tblSafetyHistory[Hours_Total],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))*{RATE_BASIS_HOURS},"")'),
     K("LTIFR_12m", "LTIFR, rolling 12 months + MTD", "rate", "custom",
       day='IFERROR((SUMIFS(tblSafety[LTI],tblSafety[Date],">="&EDATE({ms},-12),tblSafety[Date],"<="&{d})'
           '+SUMIFS(tblSafetyHistory[LTI],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))'
           '/(SUMIFS(tblSafety[Hours_Total],tblSafety[Date],">="&EDATE({ms},-12),tblSafety[Date],"<="&{d})'
-          '+SUMIFS(tblSafetyHistory[Hours_Total],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))*1000000,"")'),
+          '+SUMIFS(tblSafetyHistory[Hours_Total],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))*{RATE_BASIS_HOURS},"")'),
     K("Days_Since_LTI", "Days since last LTI", "days", "custom",
       day='IF(MAX(N(cfg_PriorLTIDate),_xlfn.MAXIFS(tblSafety[Date],tblSafety[LTI],">0",tblSafety[Date],"<="&{d}))=0,"",'
           '{d}-MAX(N(cfg_PriorLTIDate),_xlfn.MAXIFS(tblSafety[Date],tblSafety[LTI],">0",tblSafety[Date],"<="&{d})))'),
@@ -210,17 +234,20 @@ REPORT_LAYOUT = [
                 ("Near_Miss", False), ("Hazard_Reports", False), ("HPI", False), ("Env_Incidents", False), ("Community_Incidents", False),
                 ("Vehicle_Incidents", False), ("TRIFR_12m", False), ("LTIFR_12m", False), ("Days_Since_LTI", False)]),
     ("MINING", [("Ore_Mined_t", True), ("Ore_Grade_gpt", True), ("Ore_Mined_oz", True), ("Ore_Ungraded_t", False), ("Waste_t", True), ("TMM_t", True),
-                ("Strip_Ratio", True), ("Rehandle_t", False), ("Unclassified_t", False), ("Drill_m", True), ("Blast_t", False), ("Powder_Factor_kgpt", False), ("Diesel_Mining_L", True),
-                ("Exc_Availability_pct", False), ("Exc_Utilisation_pct", False), ("Trk_Availability_pct", False), ("Trk_Utilisation_pct", False)]),
+                ("Strip_Ratio", True), ("Rehandle_t", False), ("Unclassified_t", False), ("Drill_m", True), ("GC_Drill_m", False), ("Blast_t", False), ("Powder_Factor_kgpt", False), ("Diesel_Mining_L", True),
+                ("Exc_Availability_pct", False), ("Exc_Utilisation_pct", False), ("Exc_Productivity_tph", False),
+                ("Trk_Availability_pct", False), ("Trk_Utilisation_pct", False), ("Trk_Productivity_tph", False)]),
     ("PROCESSING", [("Crushed_t", False), ("Milled_t", True), ("Head_Grade_gpt", True), ("Feed_oz", True), ("Recovery_pct", True), ("Recovered_oz", True),
-                    ("Gravity_Gold_oz", False), ("Gold_Poured_oz", True), ("Throughput_tph", False), ("Mill_Run_h", False), ("Mill_Availability_pct", False),
+                    ("Gravity_Gold_oz", False), ("Gravity_Share_pct", False), ("Gold_Poured_oz", True), ("Throughput_tph", False), ("Mill_Run_h", False), ("Mill_Availability_pct", False),
                     ("Mill_Utilisation_pct", False), ("Cyanide_kgpt", False), ("Lime_kgpt", False), ("Power_kWhpt", False), ("GIC_oz", False)]),
     ("GOLD", [("Gold_Shipped_oz", False), ("Gold_Sold_oz", False), ("Dore_Shipped_kg", False)]),
 ]
 MONTHLY_KPIS = ["Hours_Worked", "Recordables", "LTI", "TRIFR_12m", "Ore_Mined_t", "Ore_Grade_gpt", "Ore_Mined_oz", "Waste_t", "TMM_t", "Strip_Ratio",
                 "Drill_m", "Milled_t", "Head_Grade_gpt", "Recovery_pct", "Recovered_oz", "Gold_Poured_oz", "Gold_Sold_oz", "Throughput_tph",
                 "Mill_Availability_pct", "Mill_Utilisation_pct", "Cyanide_kgpt", "Power_kWhpt"]
+PAGE_BREAK_BEFORE = "PROCESSING"   # Daily_Report prints on two portrait pages
 COMMENT_LINES = 15
+COMMENT_ROW_PT = 36               # three lines of 9 pt text per comment; rows stay resizable on the protected sheet
 
 
 # ----------------------------------------------------------------------------- builder
@@ -274,14 +301,12 @@ class Builder:
 
     def tbl_formula(self, tbl: str, expr: str) -> str:
         """Translate {Col} placeholders into table this-row references."""
-        out = expr.replace("{TROY}", TROY)
-        import re
+        out = const_subst(expr)
         return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: f"{tbl}[[#This Row],[{m.group(1)}]]", out)
 
     def a1_formula(self, expr: str, cols: dict, row: int) -> str:
         """Translate {Col} placeholders into A1 references on one row (conditional formats cannot use table references)."""
-        import re
-        out = expr.replace("{TROY}", TROY)
+        out = const_subst(expr)
         return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: f"${cols[m.group(1)]}{row}", out)
 
     # ---- tables ------------------------------------------------------------------
@@ -406,17 +431,21 @@ class Builder:
             dv.error = f"Choose a value from the list (edit the Lists sheet to add one)."
         elif t in ("number", "pct", "int"):
             lo, hi = f.get("min", 0), f.get("max", 1e12)
-            dv = DataValidation(type="whole" if t == "int" else "decimal", operator="between", formula1=str(lo), formula2=str(hi),
+            dv = DataValidation(type="whole" if t == "int" else "decimal", operator="between", formula1=num_text(lo), formula2=num_text(hi),
                                 allow_blank=True, showErrorMessage=True, errorStyle="warning", showInputMessage=bool(msg))
             dv.errorTitle = "Outside expected range"
-            dv.error = f"Expected between {lo} and {hi}. Click Yes to keep the value if it is correct."
+            dv.error = f"Expected between {lo:,.15g} and {hi:,.15g}. Click Yes to keep the value if it is correct."
         elif t == "date":
             # rows dated outside the year have no Calc_Daily row and would vanish from every KPI
             lo = "=EDATE(cfg_YearStart,-12)" if prefill == "prior_months" else "=cfg_YearStart"
             dv = DataValidation(type="date", operator="between", formula1=lo, formula2="=cfg_YearEnd", allow_blank=True,
                                 showErrorMessage=True, errorStyle="warning", showInputMessage=bool(msg))
-            dv.errorTitle = "Date outside the reporting year"
-            dv.error = "Dates must fall in the reporting year: rows outside it are not counted in any KPI. Click No and correct the date."
+            if prefill == "prior_months":
+                dv.errorTitle = "Month outside the prior or reporting year"
+                dv.error = "Months must fall in the prior year or the reporting year (the rolling 12-month window). Click No and correct the month."
+            else:
+                dv.errorTitle = "Date outside the reporting year"
+                dv.error = "Dates must fall in the reporting year: rows outside it are not counted in any KPI. Click No and correct the date."
         else:
             return None
         if msg:
@@ -481,7 +510,6 @@ class Builder:
     def check_catalogue(self):
         """Every tblX[Col] reference, quoted list criterion and budget column in the KPI catalogue and in the generated
         formulas must exist in the schema; otherwise Excel shows #REF! or a renamed list value silently sums to zero."""
-        import re
         s = self.s
         tables = {t["table"]: {f["name"]: f for f in t["fields"]} for t in s["tables"]}
         lists = dict(s["lists"])
@@ -566,39 +594,48 @@ class Builder:
     def sheet_config(self, ws, sample):
         site = self.s["site"]
         self.title(ws, "Config", "Site settings and opening balances. Names in column C are used by the formulas.")
+        consts = self.s["constants"]
         settings = [
             ("Site", site["name"], "cfg_Site", "text"),
             ("Company", site["company"], "cfg_Company", "text"),
-            ("Reporting year", self.year, "cfg_Year", "int"),
+            ("Report title", f"{site['name']} daily production report", "cfg_ReportTitle", "text"),
+            ("Date of last LTI before this year", sample.get("prior_lti") if sample else None, "cfg_PriorLTIDate", "date"),
+        ] + [(label, consts[key], nm, "number" if isinstance(consts[key], float) else "count") for key, (nm, label) in CONSTANTS.items()] + [
+            # calculated: the reporting year is fixed when the workbook is generated (dates in Calc_Daily and the prefilled tables)
+            ("Calculated (do not type here)", None, "", "head"),
+            ("Reporting year (from the generator; run build_workbook.py --year to change)", "=YEAR(INDEX(cd_Date,1))", "cfg_Year", "int"),
             ("Year start", "=DATE(cfg_Year,1,1)", "cfg_YearStart", "date"),
             ("Year end", "=DATE(cfg_Year,12,31)", "cfg_YearEnd", "date"),
-            ("Troy ounce (g)", self.s["constants"]["TROY_OZ_G"], "cfg_TroyOz", "number"),
-            ("Date of last LTI before this year", sample.get("prior_lti") if sample else None, "cfg_PriorLTIDate", "date"),
-            ("Last date with plant data (calculated)", '=SUMPRODUCT(MAX((tblPlant[Milled_t]<>"")*tblPlant[Date]))', "cfg_LastDataDate", "date"),
-            ("Report title", f"{site['name']} daily production report", "cfg_ReportTitle", "text"),
-            ("Plant feed stockpile check (calculated)", '=IF(COUNTIF(tblStockpiles[Plant_Feed],"Y")=1,"OK","Exactly one stockpile must have Plant_Feed = Y")', "cfg_FeedCheck", "text"),
+            ("Last date with plant data", '=SUMPRODUCT(MAX((tblPlant[Milled_t]<>"")*tblPlant[Date]))', "cfg_LastDataDate", "date"),
+            ("Plant feed stockpile check", '=IF(COUNTIF(tblStockpiles[Plant_Feed],"Y")=1,"OK","Exactly one stockpile must have Plant_Feed = Y")', "cfg_FeedCheck", "text"),
+            ("Year check", '=IF(cfg_Year<>YEAR(INDEX(cd_Date,1)),"Year mismatch: rebuild the workbook with build_workbook.py --year","")', "cfg_YearCheck", "text"),
         ]
         r = 4
         ws.cell(r, 1, "Setting").font = font(bold=True); ws.cell(r, 2, "Value").font = font(bold=True); ws.cell(r, 3, "Name").font = font(bold=True)
         for lab, val, nm, typ in settings:
             r += 1
+            if typ == "head":
+                r += 1
+                ws.cell(r, 1, lab).font = font(bold=True, color="595959")
+                continue
             ws.cell(r, 1, lab)
             c = ws.cell(r, 2, val)
-            c.number_format = FMT["date"] if typ == "date" else ("0" if typ == "int" else ("0.0000" if typ == "number" else "@"))
+            c.number_format = {"date": FMT["date"], "int": "0", "count": "#,##0", "number": "0.0000"}.get(typ, "@")
             c.font = font(color="1F3864" if not (isinstance(val, str) and val.startswith("=")) else "595959")
             c.border = BORDER
             ws.cell(r, 3, nm).font = font(color="7F7F7F", size=9)
             self.name(nm, f"Config!$B${r}")
-            if nm == "cfg_FeedCheck":
-                ws.conditional_formatting.add(f"B{r}", FormulaRule(formula=[f'B{r}<>"OK"'], fill=fill(C_WARN), font=Font(color="9C0006", bold=True)))
-        self.set_widths(ws, {"A": 36, "B": 30, "C": 18})
+            if nm in ("cfg_FeedCheck", "cfg_YearCheck"):
+                ok = '"OK"' if nm == "cfg_FeedCheck" else '""'
+                ws.conditional_formatting.add(f"B{r}", FormulaRule(formula=[f"B{r}<>{ok}"], fill=fill(C_WARN), font=Font(color="9C0006", bold=True)))
+        self.set_widths(ws, {"A": 60, "B": 30, "C": 18})
         # reference tables on Config (stockpiles, with spare rows for stockpiles opened during the year) and safety history
         col = 5
         for rname, rdef in self.s["reference_tables"].items():
             if rdef["sheet"] != "Config":
                 continue
             rows = sample.get(rdef["table"], rdef["rows"]) if sample else rdef["rows"]
-            tdef = {"table": rdef["table"], "title": "Stockpile opening balances (survey at start of year); spare rows for stockpiles opened later",
+            tdef = {"table": rdef["table"], "title": "Stockpile opening balances: surveyed tonnes at the start of Survey_Date (1 January if blank); spare rows for stockpiles opened later",
                     "fields": rdef["columns"], "rows": len(rows) + int(rdef.get("spare_rows", 0))}
             ws.cell(3, col, tdef["title"]).font = font(bold=True, color=C_HEAD)
             info = self.write_table(ws, tdef, anchor_col=col, anchor_row=4, data=rows, style="TableStyleLight9")
@@ -613,7 +650,7 @@ class Builder:
     def sheet_input(self, ws, tdef, data):
         if ws["A1"].value is None:
             self.title(ws, tdef["title"], f"Owner: {tdef.get('owner', '')}. Type only in the blue-headed columns; grey-headed columns are formulas. "
-                                          "Paste with Paste Special > Values only. Red cells need attention (missing or unknown value, duplicate date).")
+                                          "Add rows at the bottom only; never insert columns. Paste with Paste Special > Values only. Red cells need attention (missing or unknown value, duplicate date).")
             anchor_row = 4
         else:
             anchor_row = ws.max_row + 3
@@ -640,13 +677,11 @@ class Builder:
         if k.get("budget"):
             return True
         if k["kind"] == "ratio":
-            import re
-            refs = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", k["num"] + k["den"]))
-            return all(self.has_budget(KPI[x]) for x in refs if x in KPI)
+            refs = {x for x in re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", k["num"] + k["den"]) if x in KPI}
+            return bool(refs) and all(self.has_budget(KPI[x]) for x in refs)
         return False
 
     def resolve(self, expr: str, r: int, period: str = "", budget: bool = False) -> str:
-        import re
         c = self.cd_cols
 
         def rep(m):
@@ -659,8 +694,8 @@ class Builder:
                 return f"$D{r}"
             if key == "r":
                 return str(r)
-            if key == "TROY":
-                return TROY
+            if key in PLACEHOLDERS:
+                return PLACEHOLDERS[key]
             if key in KPI:
                 if budget:
                     hdr = f"Bud_{key}_{period}"
@@ -696,7 +731,7 @@ class Builder:
                 nf = FMT.get(k["unit"], FMT["number"])
                 if kind == "sum":
                     day = "=" + self.resolve(k["day"], r)
-                    mtd = f"={key}_ROW" if False else (f"=${c[key]}{r}" if r == first else f"=IF($B{r}=$B{r-1},${c[key + '_MTD']}{r-1},0)+${c[key]}{r}")
+                    mtd = f"=${c[key]}{r}" if r == first else f"=IF($B{r}=$B{r-1},${c[key + '_MTD']}{r-1},0)+${c[key]}{r}"
                     ytd = f"=${c[key]}{r}" if r == first else f"=${c[key + '_YTD']}{r-1}+${c[key]}{r}"
                     for hdr, f_ in ((key, day), (key + "_MTD", mtd), (key + "_YTD", ytd)):
                         cell = ws[f"{c[hdr]}{r}"]; cell.value = f_; cell.number_format = nf
@@ -767,7 +802,8 @@ class Builder:
                     val = f"Calc_Daily!${c['Bud_Milled_t_Month']}{r}/Calc_Daily!$D{r}"
                 else:
                     val = f"Calc_Daily!${c[src]}{r}"
-                f_ = f"=IF($A{r}>cfg_LastDataDate,NA(),{val})" if guard else f"={val}"
+                # beyond the last data date, or where the KPI is blank text (no assay yet), plot a gap rather than zero
+                f_ = f"=IF(OR($A{r}>cfg_LastDataDate,NOT(ISNUMBER({val}))),NA(),{val})" if guard else f"={val}"
                 ws.cell(r, j, f_)
         self.formula_count += (last - first + 1) * len(series)
         ws.protection.sheet = True
@@ -777,21 +813,31 @@ class Builder:
     def sheet_daily_report(self, ws):
         c = self.cd_cols
         ws.sheet_view.showGridLines = False
-        self.set_widths(ws, {"A": 2, "B": 34, "C": 8, "D": 13, "E": 13, "F": 13, "G": 9, "H": 13, "I": 13, "J": 9, "K": 2, "L": 10})
+        self.set_widths(ws, {"A": 2, "B": 34, "C": 14, "D": 13, "E": 13, "F": 13, "G": 9, "H": 13, "I": 13, "J": 9, "K": 2, "L": 10})
         ws["B2"] = "=cfg_ReportTitle"; ws["B2"].font = font(bold=True, size=16, color=C_HEAD)
         ws["B3"] = "=cfg_Company&\" | \"&cfg_Site"; ws["B3"].font = font(italic=True, color="595959")
         ws["B5"] = "Report date"; ws["B5"].font = font(bold=True)
-        ws["C5"] = self.report_date if self.report_date else "=MAX(cfg_YearStart,MIN(TODAY()-1,cfg_YearEnd,IF(N(cfg_LastDataDate)>0,cfg_LastDataDate,cfg_YearEnd)))"
+        ws["C5"] = self.report_date if self.report_date else DEFAULT_DATE_FORMULA
         ws["C5"].number_format = "ddd dd-mmm-yyyy"; ws["C5"].font = font(bold=True, color=C_HEAD); ws["C5"].fill = fill(C_KEY); ws["C5"].border = BORDER
         ws["C5"].protection = Protection(locked=False)
         ws.merge_cells("C5:E5")
-        ws["F5"] = "Type a date to change the report day. To restore the default enter =MIN(TODAY()-1,cfg_LastDataDate)"; ws["F5"].font = font(italic=True, size=9, color="7F7F7F")
+        # the instruction lives in the input message (not printed); a date outside the year is stopped, and F5 warns if one slips through
+        dv = DataValidation(type="date", operator="between", formula1="=cfg_YearStart", formula2="=cfg_YearEnd", allow_blank=False,
+                            showErrorMessage=True, errorStyle="stop", showInputMessage=True)
+        dv.errorTitle = "Date outside the reporting year"
+        dv.error = "The report date must fall in the reporting year (1 January to 31 December)."
+        dv.promptTitle = "Report date"
+        dv.prompt = ("Type a date in the reporting year to change the report day. To restore the default (yesterday, or the last day "
+                     f"with plant data) enter {DEFAULT_DATE_FORMULA}")[:255]
+        ws.add_data_validation(dv); dv.add("C5")
+        ws["F5"] = '=IF(ISNUMBER(rpt_Row),cfg_YearCheck,"Report date is outside the reporting year: enter a date between 1 January and 31 December "&cfg_Year)'
+        ws["F5"].font = font(bold=True, size=9, color="C00000")
         ws["L5"] = "=IFERROR(MATCH($C$5,cd_Date,0),NA())"; ws["L5"].font = font(color="BFBFBF", size=8)
         ws["L4"] = "row"; ws["L4"].font = font(color="BFBFBF", size=8)
         self.name("rpt_Date", "Daily_Report!$C$5")
         self.name("rpt_Row", "Daily_Report!$L$5")
-        ws["B6"] = ('="Data to "&IF(N(cfg_LastDataDate)>0,' + xl_date_text("cfg_LastDataDate") + ',"(no plant data yet)")'
-                    '&"  |  Week "&_xlfn.ISOWEEKNUM($C$5)&"  |  Day "&DAY($C$5)&" of "&DAY(EOMONTH($C$5,0))')
+        ws["B6"] = ('=IF(ISNUMBER(rpt_Row),"Data to "&IF(N(cfg_LastDataDate)>0,' + xl_date_text("cfg_LastDataDate") + ',"(no plant data yet)")'
+                    '&"  |  Week "&_xlfn.ISOWEEKNUM($C$5)&"  |  Day "&DAY($C$5)&" of "&DAY(EOMONTH($C$5,0)),"Report date is outside the reporting year")')
         ws["B6"].font = font(size=9, color="595959")
         # completeness and integrity line: rows entered for the report date per table, and movement rows no KPI can count
         ws["B7"] = ('="Rows for this date: Plant "&COUNTIFS(tblPlant[Date],rpt_Date,tblPlant[Milled_t],"<>")'
@@ -805,7 +851,10 @@ class Builder:
 
         headers = ["", "Unit", "Day", "MTD", "MTD budget", "Var %", "YTD", "YTD budget", "Var %"]
         r = 8
+        break_row = None
         for section, items in REPORT_LAYOUT:
+            if section == PAGE_BREAK_BEFORE:
+                break_row = r - 1
             for j, h in enumerate(headers):
                 cell = ws.cell(r, 2 + j, section if j == 0 else h)
                 cell.font = font(bold=True, color="FFFFFF"); cell.fill = fill(C_HEAD)
@@ -815,7 +864,9 @@ class Builder:
                 k = KPI[key]
                 nf = FMT.get(k["unit"], FMT["number"])
                 ws.cell(r, 2, k["label"]).font = font()
-                ws.cell(r, 3, "" if k["unit"] in ("int", "ratio", "rate", "days") else k["unit"]).font = font(color="7F7F7F", size=9)
+                # rates print their hours basis (per 1,000,000 h) so the reader knows the convention
+                unit = '="per "&TEXT(cfg_RateBasisHours,"#,##0")&" h"' if k["unit"] == "rate" else ("" if k["unit"] in ("int", "ratio", "days") else k["unit"])
+                ws.cell(r, 3, unit).font = font(color="7F7F7F", size=9)
                 has_periods = k["kind"] in ("sum", "ratio")
                 def idx(hdr):
                     return f'=IFERROR(INDEX(cd_{hdr},rpt_Row),"")'
@@ -843,22 +894,26 @@ class Builder:
             cell = ws.cell(r, 2 + j, h); cell.font = font(bold=True, color="FFFFFF"); cell.fill = fill(C_HEAD)
             cell.alignment = Alignment(horizontal="left" if j == 0 else "center")
         r += 1
-        in_year = 'tblMovement[Date],">="&cfg_YearStart,tblMovement[Date],"<="&rpt_Date'  # rows before the opening survey are not part of the balance
+        # balance window: from the later of 1 January and the stockpile's Survey_Date (the opening balance is the surveyed
+        # tonnage at the start of that day) to the report date; rows before it are not part of the balance
         for i in range(1, n_sp + 1):
             nm = f"INDEX(tblStockpiles[Stockpile],{i})"
-            g = f'=IF({nm}="","",'
+            since = f'">="&MAX(cfg_YearStart,N(INDEX(tblStockpiles[Survey_Date],{i})))'
+            in_win = f'tblMovement[Date],{since},tblMovement[Date],"<="&rpt_Date'
+            pl_win = f'tblPlant[Date],{since},tblPlant[Date],"<="&rpt_Date'
+            g = f'=IF(OR(NOT(ISNUMBER(rpt_Row)),{nm}=""),"",'   # blank when no stockpile is named or the report date is outside the year
             ws.cell(r, 2, f"{g}{nm})")
             ws.cell(r, 4, f"{g}INDEX(tblStockpiles[Opening_t],{i}))").number_format = FMT["t"]
             ws.cell(r, 5, f"{g}INDEX(tblStockpiles[Opening_gpt],{i}))").number_format = FMT["g/t"]
-            ws.cell(r, 6, f'{g}SUMIFS(tblMovement[Tonnes_t],tblMovement[Destination],{nm},{in_year}))').number_format = FMT["t"]
-            ws.cell(r, 7, f'{g}SUMIFS(tblMovement[Tonnes_t],tblMovement[Source],{nm},{in_year}))').number_format = FMT["t"]
-            ws.cell(r, 8, f'{g}IF(INDEX(tblStockpiles[Plant_Feed],{i})="Y",SUMIFS(tblPlant[Milled_t],tblPlant[Date],"<="&rpt_Date)-SUMIFS(tblMovement[Tonnes_t],tblMovement[Dest_Type],"Plant",{in_year}),0))').number_format = FMT["t"]
+            ws.cell(r, 6, f'{g}SUMIFS(tblMovement[Tonnes_t],tblMovement[Destination],{nm},{in_win}))').number_format = FMT["t"]
+            ws.cell(r, 7, f'{g}SUMIFS(tblMovement[Tonnes_t],tblMovement[Source],{nm},{in_win}))').number_format = FMT["t"]
+            ws.cell(r, 8, f'{g}IF(INDEX(tblStockpiles[Plant_Feed],{i})="Y",SUMIFS(tblPlant[Milled_t],{pl_win})-SUMIFS(tblMovement[Tonnes_t],tblMovement[Dest_Type],"Plant",{in_win}),0))').number_format = FMT["t"]
             ws.cell(r, 9, f'=IF($B{r}="","",D{r}+F{r}-G{r}-H{r})').number_format = FMT["t"]
             # ounces: opening + in - out - plant feed (feed oz less direct tip oz)
             oz = (f'(D{r}*E{r}/{TROY}'
-                  f'+SUMIFS(tblMovement[Contained_oz],tblMovement[Destination],{nm},{in_year})'
-                  f'-SUMIFS(tblMovement[Contained_oz],tblMovement[Source],{nm},{in_year})'
-                  f'-IF(INDEX(tblStockpiles[Plant_Feed],{i})="Y",SUMIFS(tblPlant[Feed_oz],tblPlant[Date],"<="&rpt_Date)-SUMIFS(tblMovement[Contained_oz],tblMovement[Dest_Type],"Plant",{in_year}),0))')
+                  f'+SUMIFS(tblMovement[Contained_oz],tblMovement[Destination],{nm},{in_win})'
+                  f'-SUMIFS(tblMovement[Contained_oz],tblMovement[Source],{nm},{in_win})'
+                  f'-IF(INDEX(tblStockpiles[Plant_Feed],{i})="Y",SUMIFS(tblPlant[Feed_oz],{pl_win})-SUMIFS(tblMovement[Contained_oz],tblMovement[Dest_Type],"Plant",{in_win}),0))')
             ws.cell(r, 10, f'=IFERROR(IF(AND($B{r}<>"",I{r}>0),{oz}*{TROY}/I{r},""),"")').number_format = FMT["g/t"]
             for j in range(2, 11):
                 ws.cell(r, j).border = BORDER
@@ -875,21 +930,25 @@ class Builder:
             ws.cell(r, 3, f'=IFERROR(INDEX(tblCommentary[Comment],MATCH(rpt_Date&"|"&{n},tblCommentary[Key_Day],0)),"")').font = font(size=9)
             ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=10)
             ws.cell(r, 3).alignment = Alignment(wrap_text=True, vertical="top")
-            ws.row_dimensions[r].height = 24
+            ws.row_dimensions[r].height = COMMENT_ROW_PT
             r += 1
         r += 1
         ws.cell(r, 2, '="Generated by the Mako Production System workbook. Printed "&' + xl_date_text("NOW()")
                 + '&" "&TEXT(HOUR(NOW()),"00")&":"&TEXT(MINUTE(NOW()),"00")').font = font(italic=True, size=8, color="7F7F7F")
         # print setup
+        # two portrait A4 pages: safety and mining, then processing, gold, stockpiles and commentary
         ws.print_area = f"B2:J{r}"
-        ws.page_setup.orientation = "landscape"
+        ws.page_setup.orientation = "portrait"
         ws.page_setup.paperSize = ws.PAPERSIZE_A4
         ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
+        ws.page_setup.fitToHeight = 2
         ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        if break_row:
+            ws.row_breaks.append(Break(id=break_row))
         ws.print_options.horizontalCentered = True
         ws.page_margins.left = ws.page_margins.right = 0.4
         ws.protection.sheet = True
+        ws.protection.formatRows = False   # users may enlarge a commentary row for a long comment
         self.report_last_row = r
 
     # Monthly_Summary --------------------------------------------------------------
@@ -948,7 +1007,7 @@ class Builder:
                 r += 1
             r += 1 if has_b else 0
         ws.freeze_panes = "D6"
-        ws.page_setup.orientation = "landscape"; ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+        ws.page_setup.orientation = "landscape"; ws.page_setup.paperSize = ws.PAPERSIZE_A4; ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
         ws.protection.sheet = True
 
@@ -981,14 +1040,17 @@ class Builder:
         ch1.series[1].graphicalProperties.line.dashStyle = "dash"
         ws.add_chart(ch1, "B5")
         # 2 milled daily vs budget daily
+        # bar charts get a date axis too: a text axis over 365 daily categories repeats month labels
         ch2 = BarChart(); ch2.type = "col"; ch2.add_data(ref("Milled_t"), titles_from_data=True); ch2.set_categories(dates)
+        ch2.x_axis = DateAxis(crossAx=100)
         ln = LineChart(); ln.add_data(ref("Budget_Milled_daily"), titles_from_data=True); ln.set_categories(dates)
+        ln.x_axis = DateAxis(crossAx=100)   # same axId as the bar chart's axis, so one date axis is written
         ch2 += ln; style(ch2, "Milled tonnes per day vs budget", "t"); ch2.gapWidth = 30
         ws.add_chart(ch2, "Q5")
         # 3 ore and waste
         ch3 = BarChart(); ch3.type = "col"; ch3.grouping = "stacked"; ch3.overlap = 100
         ch3.add_data(ref("Ore_Mined_t"), titles_from_data=True); ch3.add_data(ref("Waste_t"), titles_from_data=True); ch3.set_categories(dates)
-        style(ch3, "Ore and waste mined per day (t)", "t"); ch3.gapWidth = 30
+        ch3.x_axis = DateAxis(crossAx=100); style(ch3, "Ore and waste mined per day (t)", "t"); ch3.gapWidth = 30
         ws.add_chart(ch3, "B24")
         # 4 recovery MTD and head grade MTD
         ch4 = LineChart(); ch4.add_data(ref("Recovery_MTD"), titles_from_data=True); ch4.add_data(ref("Budget_Recovery_MTD"), titles_from_data=True); ch4.set_categories(dates)
@@ -1003,6 +1065,11 @@ class Builder:
         ch6 = LineChart(); ch6.add_data(ref("TRIFR_12m"), titles_from_data=True); ch6.set_categories(dates); ch6.x_axis = DateAxis(crossAx=100)
         style(ch6, "TRIFR, rolling 12 months", "per million hours")
         ws.add_chart(ch6, "B43")
+        # print: one landscape A4 page wide (charts end around column AF, row 60)
+        ws.print_area = "B2:AF60"
+        ws.page_setup.orientation = "landscape"; ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
         ws.protection.sheet = True
 
     # Data_Dictionary --------------------------------------------------------------
@@ -1016,7 +1083,6 @@ class Builder:
             for f in tdef["fields"]:
                 r += 1
                 val = f"list: {f['list']}" if f.get("list") else (f"{f.get('min', '')} to {f.get('max', '')}" if "min" in f or "max" in f else "")
-                ws.append([])  # keep row structure simple
                 for j, v in enumerate([tdef["table"], tdef["sheet"], f["name"], f.get("label", ""), "calculated" if f.get("calc") else f["type"],
                                        f.get("unit", ""), "yes" if f.get("required") or f.get("key") else (f"when {f['required_when']}" if f.get("required_when") else ""),
                                        val, f.get("desc", ""), f.get("calc", "")], start=1):
@@ -1038,6 +1104,7 @@ class Builder:
     # README -----------------------------------------------------------------------
     def sheet_readme(self, ws):
         site = self.s["site"]
+        tabs = ", ".join(dict.fromkeys(t["sheet"] for t in self.s["tables"] if t["sheet"] not in ("Config", "Lists")))
         ws.sheet_view.showGridLines = False
         ws.column_dimensions["A"].width = 3; ws.column_dimensions["B"].width = 120
         lines = [
@@ -1045,11 +1112,12 @@ class Builder:
             (f"{site['company']}. Version {self.s['version']}. Generated workbook: do not restructure by hand; change the schema and regenerate.", "sub"),
             ("", ""),
             ("How the workbook works", "h2"),
-            ("1. Inputs are the green tabs: Plant, Mining_Movements, Mining_Daily, Fleet, Safety, Gold, Commentary, Budget. Each is an Excel table. Type in the blue-headed columns only; grey-headed columns are formulas that fill automatically.", ""),
+            (f"1. Inputs are the green tabs: {tabs}. Each is an Excel table. Type in the blue-headed columns only; grey-headed columns are formulas that fill automatically.", ""),
             ("2. Calc_Daily rebuilds every KPI per day from the tables (day, month to date, year to date, budget). Daily_Report, Monthly_Summary and Dashboard read only from Calc_Daily.", ""),
             ("3. There are no links to other workbooks and no macros. Copying the file anywhere keeps it working.", ""),
             ("4. Lists holds every drop-down. Add a new pit, stockpile or equipment class there; do not type free text into list columns.", ""),
-            ("5. Config holds the year, the stockpile opening balances (survey at 1 January; exactly one stockpile has Plant_Feed = Y) and the monthly safety history used for rolling 12-month rates.", ""),
+            ("5. Config holds the site constants (troy ounce, hours per day, injury rate basis), the stockpile opening balances (exactly one stockpile has Plant_Feed = Y) and the monthly safety history used for rolling 12-month rates. The reporting year is fixed when the workbook is generated; to roll to a new year run build_workbook.py --year, do not type over it.", ""),
+            ("6. If the report opens blank behind a yellow Protected View bar (a file received by e-mail or download), click Enable Editing; the workbook then calculates.", ""),
             ("", ""),
             ("Daily routine", "h2"),
             ("Plant: enter the row for the day (dates are pre-filled). Mining: add one movement row per source, material and destination; add the Mining_Daily row and one Fleet row per equipment class. HSE: enter the Safety row. Everyone: one Commentary row per topic. Then open Daily_Report, check the date in C5 and the 'Rows for this date' line in B7, and print or export to PDF.", ""),
@@ -1060,7 +1128,8 @@ class Builder:
             ("Ore versus waste follows the Material list: anything starting with Ore counts as ore. Ex-pit movements (Source type Pit) count to TMM and strip ratio; movements from stockpiles are rehandle. Every ore row needs a grade: ore tonnes without a grade are highlighted, excluded from the grade mined and shown as 'Ore mined without a grade' on the report. Enter either one daily total per source, material and destination or Day and Night rows, never both.", ""),
             ("Recovery is calculated from head and tails grades (1 minus tails over head). Gold recovered is milled tonnes x (head minus tails) / 31.1035. A day whose head or tails grade is not yet entered shows blank recovery and is left out of the period grades, recovery and gold recovered until the assay arrives; throughput uses only days with run hours. Monthly metallurgical accounting adjustments are handled outside this workbook until the web system takes over.", ""),
             ("Mill availability and utilisation count a day once any mill hours (run, planned or unplanned) are entered; a full-day shutdown is Planned maintenance 24 with Mill run hours 0.", ""),
-            ("TRIFR and LTIFR are per million hours over the last 12 calendar months plus the current month to date. Months without daily Safety rows (the prior year, and this year before go-live) take their hours and injuries from the monthly history on Config.", ""),
+            ("Stockpile balances on the report run from the later of 1 January and the stockpile's Survey_Date (Opening_t is the surveyed tonnage at the start of that day) to the report date. After a re-survey enter the new tonnes, grade and Survey_Date on Config. The plant feed stockpile is debited with milled tonnes less direct tip, so its balance includes ore tipped to the crusher but not yet milled.", ""),
+            ("TRIFR and LTIFR are injuries per the rate basis on Config (1,000,000 hours) over the last 12 calendar months plus the current month to date. Months without daily Safety rows (the prior year, and this year before go-live) take their hours and injuries from the monthly history on Config.", ""),
             ("", ""),
             ("Support", "h2"),
             ("Schema and generator: mps_schema.json and build_workbook.py in the MPS tools folder. Report issues to the Director, Operations and Projects.", ""),
@@ -1128,7 +1197,7 @@ class Builder:
                           round(rng.uniform(3000, 3500)), None])
         sample["tblPlant"] = plant
         sample["tblMovement"] = moves
-        sample["tblMiningDaily"] = [[d, round(rng.uniform(1000, 1400)), round(rng.uniform(22000, 28000)), round(rng.uniform(5000, 7000)),
+        sample["tblMiningDaily"] = [[d, round(rng.uniform(1000, 1400)), round(rng.uniform(200, 400)), round(rng.uniform(22000, 28000)), round(rng.uniform(5000, 7000)),
                                      round(rng.uniform(30000, 40000)), round(rng.uniform(3000, 5000)), None] for d in days]
         fleet = []
         for d in days:

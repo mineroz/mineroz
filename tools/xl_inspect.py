@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import sys
 import time
@@ -67,6 +68,7 @@ BLOAT_MIN_ROWS = 10000  # declared rows above this, and > 2x the real used rows,
 # 'Sheet Name'!A1  or  SheetName!A1 ; skip [n]Sheet!A1 (external) and #REF!
 SHEET_REF_RE = re.compile(r"(?<![\]#A-Za-z0-9_\.])(?:'((?:[^']|'')+)'|([A-Za-z0-9_\.]+))!")
 EXT_INDEX_RE = re.compile(r"\[(\d+)\]")
+EXT_FILE_RE = re.compile(r"\[[^\]]*\.(xls[xmb]?|xla[m]?|xlt[xm]?|csv)\]", re.I)   # [Book.xlsx] style external path
 VBA_PROC_RE = re.compile(r"^\s*(?:Public\s+|Private\s+|Friend\s+)?(?:Static\s+)?(Sub|Function|Property\s+(?:Get|Let|Set))\s+([A-Za-z_][A-Za-z0-9_]*)", re.I | re.M)
 VBA_RISK_RE = re.compile(r"\b(Shell|Kill|CreateObject|GetObject|Application\.OnTime|SendKeys|Environ|FileCopy|RmDir|MkDir|Workbooks\.Open|ActiveWorkbook\.SaveAs|DisplayAlerts\s*=\s*False|On Error Resume Next|Sheets\([^)]*\)\.Delete|\.Delete)\b", re.I)
 
@@ -144,7 +146,8 @@ def parse_defined_names(wb_xml: ET.Element | None, sheets: list[dict]) -> list[d
             "scope": scope,
             "refers_to": ref,
             "broken": "#REF!" in ref,
-            "external": bool(EXT_INDEX_RE.search(ref)) or ("[" in ref and "]" in ref),
+            # a workbook index [1] or a file name in brackets; plain brackets are structured references (tblPlant[Date])
+            "external": bool(EXT_INDEX_RE.search(ref)) or bool(EXT_FILE_RE.search(ref)),
             "hidden": d.get("hidden") == "1",
             "builtin": name.startswith("_xlnm."),
         })
@@ -266,8 +269,9 @@ def sheet_rel_counts(zf: zipfile.ZipFile) -> dict[str, dict]:
             typ = r.get("Type", "").rsplit("/", 1)[-1]
             target = r.get("Target", "")
             if typ == "drawing":
-                dpath = "xl/" + target.replace("../", "")
-                drels = dpath.replace("drawings/", "drawings/_rels/") + ".rels"
+                # relative to xl/worksheets/ (../drawings/x.xml) or absolute in the package (/xl/drawings/x.xml, as openpyxl writes)
+                dpath = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/worksheets/" + target)
+                drels = posixpath.join(posixpath.dirname(dpath), "_rels", posixpath.basename(dpath) + ".rels")
                 if drels in names:
                     try:
                         for rr in ET.fromstring(zf.read(drels)).findall("rel:Relationship", NS):

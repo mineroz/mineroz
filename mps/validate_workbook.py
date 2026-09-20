@@ -57,7 +57,17 @@ import build_workbook as bw  # noqa: E402
 YEAR = 2026
 SAMPLE_DAYS = 74
 REPORT_DATE = date(YEAR, 2, 10)
-CHECK_DATES = [date(YEAR, 1, 1), date(YEAR, 2, 10), date(YEAR, 3, 15)]
+CHECK_DATES = [date(YEAR, 1, 1), REPORT_DATE, date(YEAR, 1, 1) + timedelta(days=SAMPLE_DAYS - 1)]
+EDGE_DATES = [date(YEAR, 2, d) for d in (5, 6, 7, 8, 9, 10)]
+
+
+def set_year(year: int):
+    """Point every date expectation at another reporting year (--year 2028 exercises the leap-year branch)."""
+    global YEAR, REPORT_DATE, CHECK_DATES, EDGE_DATES
+    YEAR = year
+    REPORT_DATE = date(YEAR, 2, 10)
+    CHECK_DATES = [date(YEAR, 1, 1), REPORT_DATE, date(YEAR, 1, 1) + timedelta(days=SAMPLE_DAYS - 1)]
+    EDGE_DATES = [date(YEAR, 2, d) for d in (5, 6, 7, 8, 9, 10)]
 TOL_SUM = 1e-6      # relative tolerance for additive figures (tonnes, ounces, hours, counts)
 TOL_RATIO = 1e-4    # relative tolerance for ratios, grades, rates and pro-rata budgets
 TOL_SAME = 1e-9     # two cells of the same recalculated workbook that must agree
@@ -228,6 +238,7 @@ KIND = {
     "Cyanide_kgpt": False, "Hours_Worked": True, "Recordables": True, "LTI": True, "Gold_Shipped_oz": True, "Gold_Sold_oz": True,
     "GIC_oz": True, "Days_Since_LTI": True, "TRIFR_12m": False, "LTIFR_12m": False,
     "Ore_Ungraded_t": True, "Unclassified_t": True, "Tails_Grade_gpt": False, "Mill_Calendar_h": True,
+    "GC_Drill_m": True, "Gravity_Share_pct": False, "Exc_Productivity_tph": False, "Trk_Productivity_tph": False,
     "Bud_Milled_t_MTD": False, "Bud_Milled_t_YTD": False, "Bud_Ore_Grade_gpt_MTD": False, "Bud_Recovery_pct_YTD": False,
 }
 
@@ -238,6 +249,7 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
     ratio that needs it (the tonnes are paired with the assay or the hours that carry them)."""
     T = S.troy
     mv, pl, sf, gd = S.rows("tblMovement"), S.rows("tblPlant"), S.rows("tblSafety"), S.rows("tblGold")
+    md, fl = S.rows("tblMiningDaily"), S.rows("tblFleet")
 
     def pit(r):
         return S.src_type.get(r["Source"]) == "Pit"
@@ -299,6 +311,10 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
         rec = total(sf, d, p, recordables)
         lti = total(sf, d, p, lambda r: num(r["LTI"]))
         shipped = total(gd, d, p, lambda r: num(r["Gold_oz"]) if r["Type"] == "Shipment" else 0.0)
+        gravity = total(pl, d, p, lambda r: num(r["Gravity_Gold_oz"]))
+        gc_m = total(md, d, p, lambda r: num(r["GC_Drill_m"]))
+        exc_h = total(fl, d, p, lambda r: num(r["Operating_h"]) if r["Equipment_Class"] == "Excavator" else 0.0)
+        trk_h = total(fl, d, p, lambda r: num(r["Operating_h"]) if r["Equipment_Class"] == "Haul Truck" else 0.0)
         sold = total(gd, d, p, lambda r: num(r["Gold_oz"]) if r["Type"] == "Sale" else 0.0)
         put("Ore_Mined_t", p, ore_t)
         put("Ore_Mined_oz", p, ore_oz)
@@ -325,6 +341,10 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
         put("Recordables", p, rec)
         put("LTI", p, lti)
         put("Gold_Shipped_oz", p, shipped)
+        put("GC_Drill_m", p, gc_m)
+        put("Gravity_Share_pct", p, div(gravity, rz))
+        put("Exc_Productivity_tph", p, div(ore_t + waste_t + rehandle, exc_h))
+        put("Trk_Productivity_tph", p, div(ore_t + waste_t + rehandle, trk_h))
         put("Gold_Sold_oz", p, sold)
     # point value: gold in circuit on the day
     gic = total(pl, d, "Day", lambda r: num(r["GIC_oz"]))
@@ -381,17 +401,19 @@ def expected_budgets(S: Sample, d: date) -> dict[str, object]:
 
 
 def expected_stockpiles(S: Sample, rd: date) -> list[dict]:
+    """Balance window per stockpile: from the later of 1 January and its Survey_Date (opening = start of that day) to rd."""
     T = S.troy
-    mv = [r for r in S.rows("tblMovement") if date(rd.year, 1, 1) <= r["Date"] <= rd]   # rows before the opening survey are not part of the balance
-    pl = [r for r in S.rows("tblPlant") if r["Date"] <= rd]
-    milled = sum(num(r["Milled_t"]) for r in pl)
-    feed_oz = sum(num(r["Milled_t"]) * num(r["Head_Grade_gpt"]) / T for r in pl)
-    tip = [r for r in mv if S.dst_type.get(r["Destination"]) == "Plant"]
-    tip_t = sum(float(r["Tonnes_t"]) for r in tip)
-    tip_oz = sum(S.oz(r) for r in tip)
     out = []
     for sp in S.rows("tblStockpiles"):
         nm, op_t, op_g = sp["Stockpile"], num(sp["Opening_t"]), num(sp["Opening_gpt"])
+        since = max(date(rd.year, 1, 1), as_date(sp["Survey_Date"]) or date(rd.year, 1, 1))
+        mv = [r for r in S.rows("tblMovement") if since <= r["Date"] <= rd]
+        pl = [r for r in S.rows("tblPlant") if since <= r["Date"] <= rd]
+        milled = sum(num(r["Milled_t"]) for r in pl)
+        feed_oz = sum(num(r["Milled_t"]) * num(r["Head_Grade_gpt"]) / T for r in pl)
+        tip = [r for r in mv if S.dst_type.get(r["Destination"]) == "Plant"]
+        tip_t = sum(float(r["Tonnes_t"]) for r in tip)
+        tip_oz = sum(S.oz(r) for r in tip)
         feeds = sp["Plant_Feed"] == "Y"
         ins = [r for r in mv if r["Destination"] == nm]
         outs = [r for r in mv if r["Source"] == nm]
@@ -458,23 +480,28 @@ def scan_errors(wb, allowed) -> dict[str, list[str]]:
     return found
 
 
-def chart_guard_allowed(wb, series, last):
-    """Only #N/A in guarded Chart_Data columns for dates after the last data date is acceptable."""
+def chart_gap_ok(cd, src: str, d: date, last) -> bool:
+    """A guarded Chart_Data cell may be #N/A after the last data date, or where the Calc_Daily value is not a number (blank ratio)."""
+    return last is None or d > last or (cd is not None and not is_num(cd.get(d, src)))
+
+
+def chart_guard_allowed(wb, series, last, cd=None):
+    """Only #N/A in guarded Chart_Data columns is acceptable, and only where chart_gap_ok says so."""
     ws = wb["Chart_Data"]
-    guarded_cols = {j + 1 for j, s in enumerate(series) if s[2]}
+    guarded = {j + 1: s[1] for j, s in enumerate(series) if s[2]}
 
     def allowed(sheet, c):
-        if sheet != "Chart_Data" or c.value != "#N/A" or c.column not in guarded_cols:
+        if sheet != "Chart_Data" or c.value != "#N/A" or c.column not in guarded:
             return False
         d = as_date(ws.cell(c.row, 1).value)
-        return d is not None and (last is None or d > last)
+        return d is not None and chart_gap_ok(cd, guarded[c.column], d, last)
 
     return allowed
 
 
 # ----------------------------------------------------------------------------- checks
-def check_calc_daily(C: Checks, S: Sample, cd: CalcDaily, dates=CHECK_DATES, tag="Calc_Daily", budgets=True):
-    for d in dates:
+def check_calc_daily(C: Checks, S: Sample, cd: CalcDaily, dates=None, tag="Calc_Daily", budgets=True):
+    for d in dates or CHECK_DATES:
         exp = expected_kpis(S, d)
         for key, periods in exp.items():
             for period, val in periods.items():
@@ -506,6 +533,9 @@ def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date, tag
     C.eq(f"{tag} C5 report date", rd, ws["C5"].value)
     C.eq(f"{tag} rpt_Row (L5) = day of year", float((rd - date(YEAR, 1, 1)).days + 1), ws["L5"].value)
     C.eq(f"{tag} B7 completeness line (rpt_Checks)", expected_checks_line(S, rd), ws["B7"].value)
+    C.eq(f"{tag} F5 warning blank (date in year, year check OK)", None, norm(ws["F5"].value))
+    C.add(f"{tag} B6 header shows data-to date and week", "Data to ... | Week ...", fmt(ws["B6"].value),
+          isinstance(ws["B6"].value, str) and ws["B6"].value.startswith("Data to ") and "Week " in ws["B6"].value)
     C.eq(f"{tag} cfg_FeedCheck (exactly one Plant_Feed = Y)", "OK", config_values(wb).get("cfg_FeedCheck"))
     r0 = find_row(ws, 2, "STOCKPILES")
     C.eq(f"{tag} plant feed warning line blank", None, ws.cell(r0 - 1, 2).value if r0 else "<no STOCKPILES block>")
@@ -640,10 +670,10 @@ def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
     C.group("Monthly_Summary all KPI rows vs Calc_Daily", n, mism)
 
 
-def check_chart_data(C: Checks, wb, series, last: date):
+def check_chart_data(C: Checks, wb, series, last: date, cd=None):
     ws = wb["Chart_Data"]
     rows = list(ws.iter_rows(values_only=True))
-    for j, (name, _src, guard) in enumerate(series):
+    for j, (name, src, guard) in enumerate(series):
         if j == 0:
             continue
         bad = []
@@ -652,12 +682,12 @@ def check_chart_data(C: Checks, wb, series, last: date):
             if d is None:
                 continue
             v = row[j]
-            if guard and d > last:
+            if guard and (d > last or (cd is not None and not is_num(cd.get(d, src)))):
                 if v != "#N/A":
                     bad.append(f"{d} {fmt(v)}")
             elif not is_num(v):
                 bad.append(f"{d} {fmt(v)}")
-        label = "NA after last data date, numeric before" if guard else "numeric all year"
+        label = "NA after last data date or blank KPI, numeric before" if guard else "numeric all year"
         C.group(f"Chart_Data {name} ({label})", len(rows) - 1, bad)
 
 
@@ -713,9 +743,6 @@ def check_blank(C: Checks, wb, series):
 
 
 # ----------------------------------------------------------------------------- edge workbook and list probe
-EDGE_DATES = [date(YEAR, 2, d) for d in (5, 6, 7, 8, 9, 10)]
-
-
 def list_catalogue(schema: dict) -> dict[str, list]:
     """Every lst_ name the generator defines: schema lists, derived lists and the key column of Lists-sheet reference tables."""
     out = dict(schema["lists"])
@@ -764,6 +791,14 @@ def make_edge(b, out: Path) -> Sample:
         for k, v in zip(names, row):
             if v is not None:
                 ws[f"{info['cols'][k]}{r}"] = v
+    # re-surveyed stockpile: Stockpile LG opening reset on 1 Feb (movements and plant rows before that day leave its balance)
+    info = b.tables["tblStockpiles"]
+    ws = wb[info["sheet"]]
+    i_lg = next(i for i, row in enumerate(smp["tblStockpiles"]) if row[0] == "Stockpile LG")
+    names = S.fields["tblStockpiles"]
+    for k, v in (("Opening_t", 160000), ("Opening_gpt", 0.58), ("Survey_Date", date(YEAR, 2, 1))):
+        smp["tblStockpiles"][i_lg][names.index(k)] = v
+        ws[f"{info['cols'][k]}{info['first'] + i_lg}"] = v
     # probe sheet: size, first and last entry of every drop-down name
     pr = wb.create_sheet("Probe")
     pr.append(["name", "rows", "first", "last"])
@@ -830,7 +865,9 @@ def main(argv=None) -> int:
     ap.add_argument("--workdir", default=None, help="folder for the built files (default: a fresh temp folder)")
     ap.add_argument("--soffice", default=shutil.which("soffice") or shutil.which("libreoffice") or "soffice", help="LibreOffice executable")
     ap.add_argument("--schema", default=str(bw.DEFAULT_SCHEMA))
+    ap.add_argument("--year", type=int, default=YEAR, help="reporting year to build and check (2028 exercises the leap-year branch)")
     a = ap.parse_args(argv)
+    set_year(a.year)
 
     t0 = time.time()
     auto = a.workdir is None
@@ -855,6 +892,12 @@ def main(argv=None) -> int:
         ref = b.wb.defined_names["cfg_LastDataDate"].attr_text.split("!")[1].replace("$", "")
         cell = b.wb["Config"][ref].value
         C.add("Config cfg_LastDataDate is a formula", "=...", str(cell)[:30], isinstance(cell, str) and cell.startswith("="))
+        dvs = [dv for dv in b.wb["Daily_Report"].data_validations.dataValidation if "C5" in str(dv.sqref)]
+        C.add("Daily_Report C5 stop validation: date within the year", "date, stop, cfg_YearStart..cfg_YearEnd",
+              f"{dvs[0].type}, {dvs[0].errorStyle}, {dvs[0].formula1}..{dvs[0].formula2}" if dvs else "none",
+              bool(dvs) and dvs[0].type == "date" and dvs[0].errorStyle == "stop" and dvs[0].formula1 == "=cfg_YearStart" and dvs[0].formula2 == "=cfg_YearEnd")
+        C.add("Daily_Report C5 default formula matches the restore hint", "same text", "same" if dvs and bw.DEFAULT_DATE_FORMULA in (dvs[0].prompt or "") else "differs",
+              bool(dvs) and bw.DEFAULT_DATE_FORMULA in (dvs[0].prompt or ""))
         for t in S.fields:
             S.rows(t)
         C.group("Sample rows match schema field order (width)", len(S.fields), S.width_problems)
@@ -870,8 +913,8 @@ def main(argv=None) -> int:
         check_calc_daily(C, S, cd)
         check_daily_report(C, S, b, wb, cd, REPORT_DATE)
         check_monthly(C, S, b, wb, cd, last)
-        check_chart_data(C, wb, b.chart_series, last)
-        found = scan_errors(wb, chart_guard_allowed(wb, b.chart_series, last))
+        check_chart_data(C, wb, b.chart_series, last, cd)
+        found = scan_errors(wb, chart_guard_allowed(wb, b.chart_series, last, cd))
         C.add("DEMO error values outside the Chart_Data guard", "0",
               str(sum(len(v) for v in found.values())) + (" " + "; ".join(f"{k}: {v[0]}" for k, v in found.items())[:60] if found else ""), not found)
         wb.close()
@@ -893,7 +936,7 @@ def main(argv=None) -> int:
         cd = CalcDaily(wb["Calc_Daily"])
         check_calc_daily(C, S_edge, cd, EDGE_DATES, "Edge Calc_Daily", budgets=False)
         check_daily_report(C, S_edge, b, wb, cd, REPORT_DATE, tag="Edge Daily_Report")
-        found = scan_errors(wb, chart_guard_allowed(wb, b.chart_series, last))
+        found = scan_errors(wb, chart_guard_allowed(wb, b.chart_series, last, cd))
         C.add("Edge error values outside the Chart_Data guard", "0",
               str(sum(len(v) for v in found.values())) + (" " + "; ".join(f"{k}: {v[0]}" for k, v in found.items())[:60] if found else ""), not found)
         check_lists(C, b, wb)
