@@ -1,0 +1,7 @@
+# Excel lock files and inspection output
+~$*
+xl_inspect_out/
+**/_inspection/
+__pycache__/
+*.pyc
+.venv/
