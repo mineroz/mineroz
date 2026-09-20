@@ -5020,7 +5020,7 @@ python3 mps/build_workbook.py --out dist/demo.xlsx --sample-days 74 --report-dat
 
 The last line of the output states the sheet, table, name and formula counts (17 sheets, 20 tables, 282 names, about 146,000 formulas for 2026). The file is saved with full recalculation on load, so Excel computes everything the first time it is opened; save it once from Excel before distributing so cached values exist for readers that do not recalculate.
 
-On site, `C:\MakoPS\01_Tools\Build-MPS.ps1` runs these two builds (blank and DEMO) into `C:\MakoPS\04_MPS`, finding or installing Python first. `dist/` is for local builds and is not committed.
+On site, `C:\MakoPS\01_Tools\Build-MPS.ps1` runs these two builds (blank and DEMO) into `C:\MakoPS\04_MPS`, finding or installing Python first. `dist/` holds the latest built pair (blank and DEMO), committed so they can be downloaded from the branch.
 
 ## Run the validator
 
@@ -5096,7 +5096,7 @@ Apply with `psql -v ON_ERROR_STOP=1 -1 -f mps/sql/schema_postgres.sql` (single t
 | `docs/data_dictionary.md` | Generated dictionary. |
 | `tools/` | Workbook inspector, the site PowerShell scripts and the bootstrap builder. See `tools/README.md`. |
 | `Setup-MakoPS.ps1` | Generated bootstrap; carries the `mps` files to the site PC. |
-| `dist/` | Local builds, not committed. |
+| `dist/` | Latest built blank and DEMO workbooks. |
 
 ## C:\MakoPS layout on site
 
