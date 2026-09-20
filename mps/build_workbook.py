@@ -664,12 +664,12 @@ class Builder:
         ws["C5"].number_format = "ddd dd-mmm-yyyy"; ws["C5"].font = font(bold=True, color=C_HEAD); ws["C5"].fill = fill(C_KEY); ws["C5"].border = BORDER
         ws["C5"].protection = Protection(locked=False)
         ws.merge_cells("C5:E5")
-        ws["F5"] = "Type a date to change the report day. Enter =TODAY()-1 to restore the default."; ws["F5"].font = font(italic=True, size=9, color="7F7F7F")
+        ws["F5"] = "Type a date to change the report day. To restore the default enter =MIN(TODAY()-1,cfg_LastDataDate)"; ws["F5"].font = font(italic=True, size=9, color="7F7F7F")
         ws["L5"] = "=IFERROR(MATCH($C$5,cd_Date,0),NA())"; ws["L5"].font = font(color="BFBFBF", size=8)
         ws["L4"] = "row"; ws["L4"].font = font(color="BFBFBF", size=8)
         self.name("rpt_Date", "Daily_Report!$C$5")
         self.name("rpt_Row", "Daily_Report!$L$5")
-        ws["B6"] = '="Data to "&TEXT(cfg_LastDataDate,"dd mmm yyyy")&"  |  Week "&_xlfn.ISOWEEKNUM($C$5)&"  |  Day "&DAY($C$5)&" of "&DAY(EOMONTH($C$5,0))'
+        ws["B6"] = '="Data to "&IF(N(cfg_LastDataDate)>0,TEXT(cfg_LastDataDate,"dd mmm yyyy"),"(no plant data yet)")&"  |  Week "&_xlfn.ISOWEEKNUM($C$5)&"  |  Day "&DAY($C$5)&" of "&DAY(EOMONTH($C$5,0))'
         ws["B6"].font = font(size=9, color="595959")
 
         headers = ["", "Unit", "Day", "MTD", "MTD budget", "Var %", "YTD", "YTD budget", "Var %"]
@@ -762,7 +762,7 @@ class Builder:
         ws.sheet_view.showGridLines = False
         self.set_widths(ws, {"A": 2, "B": 34, "C": 10, **{get_column_letter(i): 11 for i in range(4, 17)}})
         ws["B2"] = '=cfg_Site&" monthly summary "&cfg_Year'; ws["B2"].font = font(bold=True, size=16, color=C_HEAD)
-        ws["B3"] = '="Actuals to "&TEXT(cfg_LastDataDate,"dd mmm yyyy")&". Budget from the Budget sheet. Ratios are month values, not averages of days."'
+        ws["B3"] = '="Actuals to "&IF(N(cfg_LastDataDate)>0,TEXT(cfg_LastDataDate,"dd mmm yyyy"),"(no plant data yet)")&". Budget from the Budget sheet. Ratios are month values, not averages of days."'
         ws["B3"].font = font(italic=True, size=9, color="595959")
         r = 5
         ws.cell(r, 2, "KPI").font = font(bold=True, color="FFFFFF"); ws.cell(r, 2).fill = fill(C_HEAD)
@@ -817,7 +817,7 @@ class Builder:
     def sheet_dashboard(self, ws, ws_chart):
         ws.sheet_view.showGridLines = False
         ws["B2"] = '=cfg_Site&" dashboard "&cfg_Year'; ws["B2"].font = font(bold=True, size=16, color=C_HEAD)
-        ws["B3"] = '="Data to "&TEXT(cfg_LastDataDate,"dd mmm yyyy")'; ws["B3"].font = font(italic=True, size=9, color="595959")
+        ws["B3"] = '="Data to "&IF(N(cfg_LastDataDate)>0,TEXT(cfg_LastDataDate,"dd mmm yyyy"),"(no plant data yet)")'; ws["B3"].font = font(italic=True, size=9, color="595959")
         first, last = self.cd_rows
         hdr = {s[0]: i + 1 for i, s in enumerate(self.chart_series)}
 
@@ -941,28 +941,44 @@ class Builder:
         days = self.days[:n]
         sample: dict = {}
         sample["prior_lti"] = date(self.year - 1, 9, 14)
-        plant = []
+        troy = float(self.s["constants"]["TROY_OZ_G"])
+        stockpiles = [["ROM Pad", 20000, 1.2, "Y", date(self.year, 1, 1)], ["Stockpile HG", 5000, 2.1, "N", date(self.year, 1, 1)],
+                      ["Stockpile MG", 30000, 1.0, "N", date(self.year, 1, 1)], ["Stockpile LG", 150000, 0.55, "N", date(self.year, 1, 1)],
+                      ["Mineralised Waste Dump", 200000, 0.3, "N", date(self.year, 1, 1)]]
+        sample["tblStockpiles"] = stockpiles
+        # The plant draws from the Plant_Feed stockpile, so the synthetic head grade follows the ore actually
+        # delivered there (direct tip plus the running ROM pad grade); otherwise the stockpile balance goes negative.
+        feed_sp = next(r for r in stockpiles if r[3] == "Y")
+        rom_t, rom_oz = float(feed_sp[1]), feed_sp[1] * feed_sp[2] / troy
+        plant, moves = [], []
         for i, d in enumerate(days):
+            hg_t, hg_g = round(rng.uniform(2200, 2800)), round(rng.uniform(2.0, 2.5), 2)
+            tip_t, tip_g = round(rng.uniform(800, 1200)), round(rng.uniform(2.0, 2.5), 2)
+            lg_t, lg_g = round(rng.uniform(1200, 1800)), round(rng.uniform(0.5, 0.7), 2)
+            rh_t, rh_g = round(rng.uniform(2500, 3500)), 0.6
+            moves.append([d, None, "Petowal Pit", "Ore HG", feed_sp[0], hg_t, hg_g, None, None, None])
+            moves.append([d, None, "Petowal Pit", "Ore HG", "Crusher Direct Tip", tip_t, tip_g, None, None, None])
+            moves.append([d, None, "Petowal Pit", "Ore LG", "Stockpile LG", lg_t, lg_g, None, None, None])
+            moves.append([d, None, "Petowal Pit", "Waste", "Waste Dump", round(rng.uniform(16000, 20000)), None, None, None, None])
+            moves.append([d, None, "Petowal Pit", "Mineralised Waste", "Mineralised Waste Dump", round(rng.uniform(600, 1000)), round(rng.uniform(0.3, 0.4), 2), None, None, None])
+            moves.append([d, None, "Stockpile LG", "Ore LG", feed_sp[0], rh_t, rh_g, None, None, None])
+            rom_t += hg_t + rh_t
+            rom_oz += (hg_t * hg_g + rh_t * rh_g) / troy
             milled = round(rng.uniform(5800, 7000))
-            head = round(rng.uniform(1.3, 1.9), 2)
+            draw = milled - tip_t
+            head = round((tip_t * tip_g + draw * rom_oz / rom_t * troy) / milled * rng.uniform(0.97, 1.03), 2)
+            rom_t -= draw
+            rom_oz -= (milled * head - tip_t * tip_g) / troy
             tails = round(rng.uniform(0.08, 0.14), 3)
             planned = 8 if i % 14 == 13 else 0
             unplanned = round(rng.choice([0, 0, 0.5, 1, 2]), 1)
             run = round(24 - planned - unplanned - rng.uniform(0, 0.5), 1)
-            poured = round(milled * (head - tails) / 31.1035 * 3 * rng.uniform(0.9, 1.1)) if i % 3 == 2 else 0
+            poured = round(milled * (head - tails) / troy * 3 * rng.uniform(0.9, 1.1)) if i % 3 == 2 else 0
             plant.append([d, milled + rng.randint(-200, 300), milled, head, tails, round(rng.uniform(30, 60)), poured, run, planned, unplanned,
                           round(rng.uniform(14, 18), 1), round(milled * rng.uniform(0.35, 0.45)), round(milled * rng.uniform(1.2, 1.6)),
                           round(milled * rng.uniform(0.8, 1.0)), round(milled * rng.uniform(28, 34)), round(milled * rng.uniform(0.9, 1.2)),
                           round(rng.uniform(3000, 3500)), None])
         sample["tblPlant"] = plant
-        moves = []
-        for i, d in enumerate(days):
-            moves.append([d, None, "Petowal Pit", "Ore HG", "ROM Pad", round(rng.uniform(2200, 2800)), round(rng.uniform(1.6, 2.0), 2), None, None, None])
-            moves.append([d, None, "Petowal Pit", "Ore HG", "Crusher Direct Tip", round(rng.uniform(800, 1200)), round(rng.uniform(1.6, 2.0), 2), None, None, None])
-            moves.append([d, None, "Petowal Pit", "Ore LG", "Stockpile LG", round(rng.uniform(1200, 1800)), round(rng.uniform(0.5, 0.7), 2), None, None, None])
-            moves.append([d, None, "Petowal Pit", "Waste", "Waste Dump", round(rng.uniform(16000, 20000)), None, None, None, None])
-            moves.append([d, None, "Petowal Pit", "Mineralised Waste", "Mineralised Waste Dump", round(rng.uniform(600, 1000)), round(rng.uniform(0.3, 0.4), 2), None, None, None])
-            moves.append([d, None, "Stockpile LG", "Ore LG", "ROM Pad", round(rng.uniform(2500, 3500)), 0.6, None, None, None])
         sample["tblMovement"] = moves
         sample["tblMiningDaily"] = [[d, round(rng.uniform(1000, 1400)), round(rng.uniform(22000, 28000)), round(rng.uniform(5000, 7000)),
                                      round(rng.uniform(30000, 40000)), round(rng.uniform(3000, 5000)), None] for d in days]
@@ -996,9 +1012,6 @@ class Builder:
             for j in range(rng.randint(2, 3)):
                 comments.append([d, areas[(i + j * 3) % len(areas)], texts[(i + j) % len(texts)], "DEMO"])
         sample["tblCommentary"] = comments
-        sample["tblStockpiles"] = [["ROM Pad", 20000, 1.2, "Y", date(self.year, 1, 1)], ["Stockpile HG", 5000, 2.1, "N", date(self.year, 1, 1)],
-                                   ["Stockpile MG", 30000, 1.0, "N", date(self.year, 1, 1)], ["Stockpile LG", 150000, 0.55, "N", date(self.year, 1, 1)],
-                                   ["Mineralised Waste Dump", 200000, 0.3, "N", date(self.year, 1, 1)]]
         return sample
 
 
