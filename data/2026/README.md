@@ -1,1 +1,1 @@
-Drop PMC_Operation_Data_2026, PMC_Operation_Report_2026 and PMC_Operation_Commentary_2026 here for inspection.
+Placeholder. Workbooks are not committed to this public repository; the setup script copies them to C:\MakoPS\02_Source\2026 on your machine.

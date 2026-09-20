@@ -23,11 +23,15 @@ import json
 import os
 import re
 import sys
+import warnings
 import zipfile
+from urllib.parse import unquote
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
+
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 try:
     import openpyxl
@@ -116,10 +120,12 @@ def parse_external_links(zf: zipfile.ZipFile) -> list[dict]:
 
 def resolve_link_target(target: str, base_dir: Path) -> dict:
     """Best-effort check whether the external target exists on this machine."""
-    t = target
+    t = unquote(target)
     if t.lower().startswith("file:///"):
         t = t[8:]
-    t = t.replace("%20", " ").replace("/", os.sep)
+    elif t.lower().startswith("file://"):
+        t = "\\\\" + t[7:]
+    t = t.replace("/", os.sep)
     candidates = []
     if os.path.isabs(t) or re.match(r"^[A-Za-z]:", t) or t.startswith("\\\\"):
         candidates.append(Path(t))
@@ -504,7 +510,7 @@ def render_report(results: list[dict], base: Path) -> str:
     graph_rows = []
     for r in results:
         for l in r.get("external_links", []):
-            tgt = l["target"].replace("%20", " ")
+            tgt = unquote(l["target"])
             tgt_name = tgt.replace("\\", "/").rsplit("/", 1)[-1]
             inset = "yes" if tgt_name.lower() in names else "NO (outside this set)"
             graph_rows.append([r["name"], f"[{l['index']}]", tgt[:110], "ok" if l.get("resolved") else "MISSING", inset, l.get("formulas_using", 0), ", ".join(l["sheets_referenced"][:6])])
