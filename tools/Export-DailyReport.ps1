@@ -56,6 +56,14 @@ param(
 # No native commands run here, so Stop is safe and makes every COM failure land in the catch/finally blocks.
 $ErrorActionPreference = "Stop"
 
+# Excel COM binds through the thread culture. A Windows regional format with no matching Office
+# language (for example French (Senegal) with English Office) raises 0x80028018, "Old format or
+# invalid type library", on the first property set. en-US also keeps English day and month names
+# in the file name and the mail subject.
+$culture = [System.Globalization.CultureInfo]::GetCultureInfo("en-US")
+[System.Threading.Thread]::CurrentThread.CurrentCulture = $culture
+[System.Threading.Thread]::CurrentThread.CurrentUICulture = $culture
+
 $Date = $Date.Date
 if ([string]::IsNullOrWhiteSpace($Workbook)) { $Workbook = Join-Path $Root ("04_MPS\MPS_{0}.xlsx" -f $Date.Year) }
 if (-not (Test-Path -LiteralPath $Workbook)) { throw "Workbook not found: $Workbook  (run Build-MPS.ps1 first, or pass -Workbook)" }

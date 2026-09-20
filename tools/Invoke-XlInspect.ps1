@@ -52,6 +52,12 @@ if ([string]::IsNullOrWhiteSpace($Out)) {
     if (Test-Path (Join-Path $root "02_Source")) { $Out = Join-Path $root "03_Inspection" }
     else { $Out = Join-Path $Source "_inspection" }
 }
+# Absolute paths without a trailing backslash: Windows PowerShell 5.1 hands 'D:\Ops Reports\' to python.exe
+# as "D:\Ops Reports\" and the C runtime reads \" as a literal quote, which swallows the next argument.
+$Source = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Source)
+$Out = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out)
+if ($Source -notmatch '^[A-Za-z]:\\$') { $Source = $Source.TrimEnd('\') }
+if ($Out -notmatch '^[A-Za-z]:\\$') { $Out = $Out.TrimEnd('\') }
 
 # ---------------------------------------------------------------- python and packages
 $py = Resolve-Python -NoInstall:$NoInstall

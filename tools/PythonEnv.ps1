@@ -7,16 +7,20 @@
         . (Join-Path $here "PythonEnv.ps1")
 
     Functions:
-        Find-Python       path of the first real Python 3.8+ on this PC, or $null. Ignores the
-                          Microsoft Store stub under \Microsoft\WindowsApps\, checks PATH, the
-                          py launcher and the usual install folders (per-user, Program Files,
-                          C:\Python3x, Anaconda and Miniconda).
+        Find-Python       path of the first real Python 3.8+ on PATH or behind the py launcher,
+                          otherwise the newest one in the usual install folders (per-user,
+                          Program Files, C:\Python3x, Anaconda and Miniconda), or $null. Every
+                          candidate is probed for its version; the Microsoft Store stub under
+                          \Microsoft\WindowsApps\ fails that probe (exit code 9009) and is
+                          skipped, while a real Store Python at the same path is accepted.
         Install-Python    installs Python 3.12 for the current user from python.org, silently
-                          (InstallAllUsers=0 PrependPath=1, no admin rights), with winget as
-                          fallback, then refreshes PATH for the running session.
+                          (InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1, no admin
+                          rights, through the Windows proxy when one is configured), with winget
+                          as fallback, then refreshes PATH for the running session.
         Test-PyModule     $true when the given interpreter can import the module.
-        Ensure-PyModules  pip installs each missing module, retrying with --user, and throws
-                          with a manual command when a module still cannot be imported.
+        Ensure-PyModules  pip installs each missing module (passing the Windows proxy when one
+                          applies), retrying with --user, and throws with a manual command when
+                          a module still cannot be imported.
         Resolve-Python    Find-Python, then Install-Python unless -NoInstall, then Find-Python
                           again. Returns the interpreter path or throws.
 
@@ -32,8 +36,9 @@ function Test-RealPython {
     param([string]$Exe)
     $ErrorActionPreference = "Continue"
     if ([string]::IsNullOrWhiteSpace($Exe)) { return $false }
-    if ($Exe -like "*\Microsoft\WindowsApps\*") { return $false }   # Store stub: prints a message and exits 9009
     if (-not (Test-Path -LiteralPath $Exe)) { return $false }
+    # The Microsoft Store stub (python.exe under \Microsoft\WindowsApps\) prints a message and exits 9009 when
+    # given arguments, so the exit code test below rejects it; a real Store Python at the same path passes.
     $v = $null
     try { $v = & $Exe -c "import sys; print(sys.version_info[0]*100 + sys.version_info[1])" 2>$null }
     catch { return $false }
@@ -50,7 +55,7 @@ function Find-Python {
         Get-Command $name -All -ErrorAction SilentlyContinue | ForEach-Object { $candidates.Add($_.Source) }
     }
     $pyl = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($pyl -and $pyl.Source -notlike "*\Microsoft\WindowsApps\*") {
+    if ($pyl) {
         $resolved = $null
         try { $resolved = & $pyl.Source -3 -c "import sys; print(sys.executable)" 2>$null } catch { }
         if ($LASTEXITCODE -eq 0 -and $resolved) { $candidates.Add(("$resolved").Trim()) }
@@ -66,23 +71,49 @@ function Find-Python {
         "$env:ProgramData\anaconda3\python.exe"
     )
     foreach ($g in $globs) {
-        Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | ForEach-Object { $candidates.Add($_.FullName) }
+        # newest first by the file version resource, not by name (a name sort puts Python39 above Python312)
+        Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Sort-Object { $_.VersionInfo.FileVersionRaw } -Descending | ForEach-Object { $candidates.Add($_.FullName) }
     }
     foreach ($c in $candidates) { if (Test-RealPython $c) { return $c } }
     return $null
 }
 
+function Use-SystemProxy {
+    # Windows PowerShell 5.1 uses the proxy from Internet Options but sends it no credentials, so an
+    # authenticating site proxy answers 407. Attach the current user's credentials to the default proxy.
+    try {
+        $proxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        $proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        [System.Net.WebRequest]::DefaultWebProxy = $proxy
+    } catch { }
+}
+
+function Get-PipProxyArgs {
+    # pip reads a static proxy from Internet Options but not a proxy script (PAC). Resolve the proxy
+    # Windows would use for PyPI and return it as pip arguments, or an empty array for a direct connection.
+    try {
+        $target = [uri]"https://pypi.org/"
+        $p = [System.Net.WebRequest]::GetSystemWebProxy().GetProxy($target)
+        if ($p -and $p.Host -ne $target.Host) { return @("--proxy", $p.AbsoluteUri) }
+    } catch { }
+    return @()
+}
+
 function Install-Python {
     param([string]$Version = "3.12.10")   # last 3.12 release with a Windows installer
     $ErrorActionPreference = "Continue"
+    $ProgressPreference = "SilentlyContinue"   # the 5.1 progress bar makes Invoke-WebRequest many times slower
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
     $url = "https://www.python.org/ftp/python/$Version/python-$Version-$arch.exe"
     $installer = Join-Path $env:TEMP "python-$Version-$arch.exe"
-    Write-Host "Python 3 not found. Installing Python $Version for the current user (no admin rights, about 100 MB, 1-2 minutes) ..."
+    Write-Host "Python 3 not found. Installing Python $Version for the current user (no admin rights, 25 MB download, about 100 MB installed, 1-2 minutes) ..."
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Use-SystemProxy
         Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -ErrorAction Stop
-        $p = Start-Process -FilePath $installer -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0 Include_doc=0" -Wait -PassThru
+        # InstallLauncherAllUsers=0: the py launcher defaults to a per-machine component, which asks for
+        # elevation even in a per-user /quiet install.
+        $p = Start-Process -FilePath $installer -ArgumentList "/quiet InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0 Include_doc=0" -Wait -PassThru
         # 0 = ok, 3010 = ok but a restart is pending
         if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "installer exit code $($p.ExitCode)" }
         Write-Host "Python installed."
@@ -93,8 +124,9 @@ function Install-Python {
         & $wg.Source install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements 2>&1 | ForEach-Object { Write-Host "  $_" }
         if ($LASTEXITCODE -ne 0) { throw "winget install failed with exit code $LASTEXITCODE. Install Python 3 manually from https://www.python.org/downloads/windows/ and re-run." }
     }
-    # refresh PATH for this session so the new interpreter is visible without opening a new window
-    $env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
+    # refresh PATH for this session so the new interpreter is visible without opening a new window;
+    # Machine then User as in a fresh window, and the entries this process already had are kept
+    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User") + ";" + $env:Path
 }
 
 function Test-PyModule {
@@ -109,15 +141,18 @@ function Test-PyModule {
 function Ensure-PyModules {
     param([string]$Python, [string[]]$Modules)
     $ErrorActionPreference = "Continue"
+    $proxyArgs = @(Get-PipProxyArgs)
     foreach ($m in $Modules) {
         if (Test-PyModule $Python $m) { continue }
         Write-Host "Installing Python package $m ..."
-        & $Python -m pip install --quiet --disable-pip-version-check $m 2>&1 | ForEach-Object { Write-Host "  $_" }
+        if ($proxyArgs.Count -gt 0) { Write-Host "  via proxy $($proxyArgs[1])" }
+        & $Python -m pip install --quiet --disable-pip-version-check @proxyArgs $m 2>&1 | ForEach-Object { Write-Host "  $_" }
         if (-not (Test-PyModule $Python $m)) {
-            & $Python -m pip install --quiet --disable-pip-version-check --user $m 2>&1 | ForEach-Object { Write-Host "  $_" }
+            & $Python -m pip install --quiet --disable-pip-version-check --user @proxyArgs $m 2>&1 | ForEach-Object { Write-Host "  $_" }
         }
         if (-not (Test-PyModule $Python $m)) {
-            throw "Could not install Python package '$m'. Install it manually:  `"$Python`" -m pip install $m"
+            $manual = (@("`"$Python`"", "-m", "pip", "install") + $proxyArgs + @($m)) -join " "
+            throw "Could not install Python package '$m'. Install it manually:  $manual"
         }
     }
 }

@@ -67,7 +67,7 @@ Outlook for `-Email`. The scripts target Windows PowerShell 5.1 and need no admi
 | `tools/Export-DailyReport.ps1` | Daily_Report to PDF via Excel, optional Outlook mail. |
 | `tools/xl_inspect.py` | Workbook structural audit. See `tools/README.md`. |
 | `tools/build_setup.py` | Rebuilds and verifies `Setup-MakoPS.ps1` from the files in `tools/` and `mps/`. |
-| `docs/` | Generated documentation such as the data dictionary. |
+| `docs/` | `MPS_Design.md` (hand-written design note) and generated documentation such as `data_dictionary.md`. |
 | `data/2026/` | Placeholder only. Workbooks stay on C: and X:, never in this public repository. |
 
 After changing any file that `Setup-MakoPS.ps1` embeds, run `python tools/build_setup.py`

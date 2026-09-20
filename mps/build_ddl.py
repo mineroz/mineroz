@@ -12,10 +12,11 @@ writes, with no arguments and byte-identical output on every run:
     docs/data_dictionary.md       field-level dictionary and the Excel to SQL mapping
 
 Everything about the data model comes from the schema and from the KPI catalogue
-in build_workbook.py (KPIS). The only knowledge typed into this file is listed
-under MODEL RULES below; each rule is honoured from the schema first when the
-schema carries the matching key (sql_table, sql_name, unique, sql_postgres,
-sql_sqlite), so it can move into the schema without touching the generator.
+in build_workbook.py (KPIS): table and column names (schema keys sql_table,
+sql_name), natural keys (unique), dialect-specific calc expressions (sql_postgres,
+sql_sqlite) and the constants ({TROY}, {HOURS_PER_DAY}, {RATE_BASIS_HOURS} in calc
+sql expressions). The only knowledge typed into this file is listed under MODEL
+RULES below.
 
 Mapping (documented again in the header of each SQL file and in the dictionary):
   * tables: Excel table name without the tbl prefix, CamelCase to snake_case;
@@ -48,7 +49,7 @@ OUT_DICTIONARY = ROOT / "docs" / "data_dictionary.md"
 
 sys.path.insert(0, str(HERE))
 try:
-    from build_workbook import KPIS  # the KPI catalogue is the single source of KPI definitions
+    from build_workbook import KPIS, CONSTANTS  # the KPI catalogue is the single source of KPI definitions
 except ImportError as exc:  # pragma: no cover - environment problem, not a schema problem
     sys.exit(f"build_ddl.py needs build_workbook.py (and openpyxl) next to it: {exc}")
 
@@ -63,37 +64,21 @@ SQL_TYPES = {
 NUMERIC_TYPES = ("number", "pct")
 
 # ----------------------------------------------------------------------------- MODEL RULES
-# Rules the schema does not carry yet. Schema keys win when present (see module docstring).
-
-# Natural key of the tables that hold several rows per day (schema key "unique").
-NATURAL_KEYS = {
-    "tblMovement": ["Date", "Shift", "Source", "Material", "Destination"],
-    "tblFleet": ["Date", "Equipment_Class"],
-}
+# Rules the schema does not carry yet.
 
 # Reference table keys that must also exist as keys of other reference tables
 # (schema desc of Stockpiles.Stockpile: "must match a Source and a Destination").
 REF_KEY_MATCHES = {"Stockpiles": ["Sources", "Destinations"]}
 
-# Dialect-specific replacements for calc "sql" expressions that are not portable
-# (schema keys "sql_postgres" / "sql_sqlite" win when present).
-# tblBudget.Days: the schema expression date_trunc('month', month) resolves to the
-# timestamptz overload in PostgreSQL, which is only STABLE, so it is refused inside
-# a generated column; the cast to timestamp makes it IMMUTABLE. SQLite has no EXTRACT.
-SQL_OVERRIDES = {
-    ("tblBudget", "Days"): {
-        "postgres": "EXTRACT(DAY FROM (date_trunc('month', month::timestamp) + INTERVAL '1 month - 1 day'))::integer",
-        "sqlite": "CAST(strftime('%d', date(month, 'start of month', '+1 month', '-1 day')) AS INTEGER)",
-    },
-}
-
 # KPI catalogue entries whose Excel Day formula is neither a plain SUMIFS over one table
 # nor arithmetic over other KPIs. "agg" runs inside the per-table aggregate (GROUP BY date);
-# {num:column} is the column cast to REAL in SQLite. "custom" names a handler in Model.custom_kpi
-# that runs in the final SELECT over the base row b (one row per date).
+# {num:column} is the column cast to REAL in SQLite; {HOURS_PER_DAY} and the other schema constants are
+# substituted. "custom" names a handler in Model.custom_kpi that runs in the final SELECT over the base
+# row b (one row per date).
 KPI_SQL = {
-    # COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Run_h],"<>")*24: 24 h for each day with a mill run entry
-    "Mill_Calendar_h": {"agg": ("tblPlant", "COUNT(mill_run_h) * 24")},
+    # IF(COUNTIFS(run)+COUNTIFS(planned)+COUNTIFS(unplanned)>0,{HOURS_PER_DAY},0): a full day of calendar
+    # hours for each day with any mill hours entered, else 0
+    "Mill_Calendar_h": {"agg": ("tblPlant", "CASE WHEN COUNT(COALESCE(mill_run_h, mill_planned_maint_h, mill_unplanned_down_h)) > 0 THEN {HOURS_PER_DAY} ELSE 0 END")},
     # point value: the day's GIC when reported, else NULL (Excel shows blank)
     "GIC_oz": {"agg": ("tblPlant", "NULLIF(SUM({num:gic_oz}), 0)"), "nullable": True},
     # rolling 12 calendar months plus month to date, per million hours; prior-year months come from
@@ -155,6 +140,12 @@ class Model:
         self.sqlite_generated = sqlite_generated
         self.troy = schema["constants"]["TROY_OZ_G"]
         self.rate_basis = schema["constants"].get("RATE_BASIS_HOURS", 1000000)
+        # {NAME} placeholders in sql expressions and KPI_SQL, and the Config names used by the KPI catalogue
+        self.consts = {"{TROY}": self.troy}
+        for k, value in schema["constants"].items():
+            self.consts["{" + k + "}"] = value
+            if k in CONSTANTS:
+                self.consts[CONSTANTS[k][0]] = value  # cfg_TroyOz and friends in the KPI catalogue
         self.lists = dict(schema["lists"])
         self.lists.update(schema.get("derived_lists", {}))
         self.ref_tables = schema["reference_tables"]
@@ -196,7 +187,19 @@ class Model:
         return None
 
     def natural_key(self, tdef: dict) -> list[str]:
-        return list(tdef.get("unique") or NATURAL_KEYS.get(tdef["table"], []))
+        """Schema key "unique": a list of column groups; one group per table is supported."""
+        groups = tdef.get("unique") or []
+        if groups and not isinstance(groups[0], list):
+            groups = [groups]
+        if len(groups) > 1:
+            raise NotImplementedError(f"{tdef['table']}: only one unique column group is supported")
+        return list(groups[0]) if groups else []
+
+    def const_sql(self, expr: str) -> str:
+        """Replace {TROY}, {HOURS_PER_DAY}, ... and their cfg_ names with the schema constants."""
+        for k, v in self.consts.items():
+            expr = expr.replace(k, repr(v))
+        return expr
 
     def list_target(self, f: dict) -> tuple[str, str]:
         lst = f["list"]
@@ -216,10 +219,10 @@ class Model:
 
     # ---- calculated fields -------------------------------------------------------
     def calc_expr(self, tdef: dict, f: dict, dialect: str) -> str | None:
-        expr = f.get(f"sql_{dialect}") or SQL_OVERRIDES.get((tdef["table"], f["name"]), {}).get(dialect) or f.get("sql")
+        expr = f.get(f"sql_{dialect}") or f.get("sql")
         if not expr:
             return None
-        return expr.replace("{TROY}", repr(self.troy))
+        return self.const_sql(expr)
 
     def same_row_inputs_only(self, tdef: dict, expr: str) -> bool:
         body = re.sub(r"'(?:[^']|'')*'", "''", expr)
@@ -476,7 +479,7 @@ class Model:
             if ov and "agg" in ov:
                 tbl, expr = ov["agg"]
                 expr = re.sub(r"\{num:(\w+)\}", lambda m: self.num(tbl, m.group(1), dialect), expr)
-                e.update(mode="agg", table=tbl, agg=expr, nullable=ov.get("nullable", False))
+                e.update(mode="agg", table=tbl, agg=self.const_sql(expr), nullable=ov.get("nullable", False))
             elif ov and "custom" in ov:
                 e.update(mode="custom", custom=ov["custom"], column=ov.get("column"), nullable=True)
             elif k["kind"] == "sum":
@@ -485,6 +488,9 @@ class Model:
                     tbl, col = m.group(1), m.group(2).lower()
                     crit = []
                     for c, v in CRIT_RE.findall(m.group(3)):
+                        if v == '"<>"':  # Excel: not blank
+                            crit.append(f"{c.lower()} IS NOT NULL")
+                            continue
                         lit = sql_str(v[1:-1]) if v.startswith('"') else v
                         crit.append(f"{c.lower()} = {lit}")
                     ref = self.num(tbl, col, dialect)
@@ -496,7 +502,7 @@ class Model:
                     skipped.append(key)
                     continue
             elif k["kind"] == "ratio":
-                e.update(mode="ratio", num=k["num"].replace("cfg_TroyOz", repr(self.troy)), den=k["den"].replace("cfg_TroyOz", repr(self.troy)))
+                e.update(mode="ratio", num=self.const_sql(k["num"]), den=self.const_sql(k["den"]))
                 e["nullable"] = True
             else:
                 skipped.append(key)
@@ -768,7 +774,7 @@ class Model:
         L.append("")
         L.append("- Table names drop the `tbl` prefix and become snake_case; tables with one row per day get the suffix `_daily`. Column names are the Excel field names in lower case.")
         L.append("- Primary key: the date or month column of the tables prefilled with one row per period; an `id` column (`BIGSERIAL` in PostgreSQL, `INTEGER PRIMARY KEY AUTOINCREMENT` in SQLite) elsewhere. "
-                 "Natural keys: " + "; ".join(f"`{self.tname(self.by_excel[t])}` ({', '.join(c.lower() for c in cols)})" for t, cols in NATURAL_KEYS.items()) +
+                 "Natural keys: " + "; ".join(f"`{self.tname(t)}` ({', '.join(c.lower() for c in self.natural_key(t))})" for t in self.s["tables"] if self.natural_key(t)) +
                  ". Where a natural-key column is optional (movement shift, blank for a daily total) the uniqueness is a unique index on `COALESCE(column, '')` so that two daily totals cannot be entered twice.")
         L.append("- `NOT NULL` for required and key fields. `CHECK` constraints from the schema min and max; Excel only warns, SQL rejects. Month columns must be the first day of the month.")
         L.append("- List fields reference `ref_<list>` tables seeded with the drop-down values in order (`sort_order`). `movement.source` and `movement.destination` reference the `sources` and `destinations` tables; `stockpiles.stockpile` must exist in both.")
@@ -830,13 +836,17 @@ class Model:
 
         def show(expr: str) -> str:
             return REF_RE.sub(lambda m: by_key[m.group(1)]["col"], expr)
+
+        def term(expr: str) -> str:  # parenthesise compound operands so the precedence reads as in the view
+            out = show(expr)
+            return f"({out})" if re.search(r"[-+*/]", out) else out
         for e in entries:
             if e["mode"] == "agg":
                 d = f"{e['agg']} over `{self.tname(self.by_excel[e['table']])}` per date"
             elif e["mode"] == "expr":
                 d = show(e["expr"])
             elif e["mode"] == "ratio":
-                d = f"{show(e['num'])} / {show(e['den'])}"
+                d = f"{term(e['num'])} / {term(e['den'])}"
             else:
                 d = {"rate12": f"({e.get('column')} over the last 12 calendar months plus month to date) * {self.rate_basis} / hours_total over the same window; prior months from safety_history where safety_daily has no rows",
                      "days_since_lti": "date minus the last date in safety_daily with lti > 0"}[e["custom"]]

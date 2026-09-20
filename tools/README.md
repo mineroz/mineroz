@@ -27,10 +27,10 @@ parameters of its own.
 
 | Function | Purpose |
 |---|---|
-| `Find-Python` | first real Python 3.8+ on the PC: PATH, the `py` launcher, per-user and Program Files installs, Anaconda and Miniconda. The Microsoft Store stub under `\Microsoft\WindowsApps\` is ignored. |
-| `Install-Python` | silent per-user install of Python 3.12 from python.org (`InstallAllUsers=0 PrependPath=1`, no admin rights), winget as fallback, then refreshes PATH for the running session |
+| `Find-Python` | first real Python 3.8+ on PATH or behind the `py` launcher, otherwise the newest one in the per-user and Program Files install folders, Anaconda and Miniconda. Every candidate is probed for its version, which rejects the Microsoft Store stub (exit code 9009) but accepts a real Store Python. |
+| `Install-Python` | silent per-user install of Python 3.12 from python.org (`InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1`, no admin rights, through the Windows proxy with the user's credentials), winget as fallback, then refreshes PATH for the running session |
 | `Test-PyModule` | `$true` when the interpreter can import a module |
-| `Ensure-PyModules` | `pip install` of each missing module, retried with `--user`, with a manual command in the error when that fails too |
+| `Ensure-PyModules` | `pip install` of each missing module (with `--proxy` when Windows routes PyPI through a proxy), retried with `--user`, with a manual command in the error when that fails too |
 | `Resolve-Python` | `Find-Python`, then `Install-Python` unless `-NoInstall`, then `Find-Python` again |
 
 The functions run native executables, so they set `$ErrorActionPreference = "Continue"` in
@@ -150,6 +150,10 @@ python tools/build_setup.py --check    # only verify the existing Setup-MakoPS.p
 The verification extracts every here-string from the generated file and compares it with its
 source, the target path and the BOM flag. Re-run the build after changing any embedded file.
 `Setup-MakoPS.ps1` accepts `-Root`, `-Source`, `-Year`, `-SkipCopy`, `-SkipRun` and `-SkipBuild`.
+It resolves Python once (installing it when missing) and passes `-NoInstall` to the two child
+scripts; when Python cannot be resolved the audit and the build are skipped with a warning and
+the setup still finishes. The audit and the build run in try/catch blocks, so one failure does
+not stop the other, and a single Explorer window is opened on the root at the end.
 
 ## Conventions
 

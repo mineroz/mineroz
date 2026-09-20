@@ -9,8 +9,9 @@
         <Root>\04_MPS\MPS_<Year>_DEMO.xlsx   the same workbook with <SampleDays> days of synthetic DEMO data
 
     Existing files are overwritten, so close them in Excel before re-running. The generator is
-    looked up at <Root>\01_Tools\mps\build_workbook.py (C:\MakoPS layout); when this script runs
-    from the repository, <repo>\mps\build_workbook.py is used instead.
+    looked up next to this script first (<Root>\01_Tools\mps\build_workbook.py in the C:\MakoPS
+    layout, <repo>\mps\build_workbook.py when this script runs from the repository), then under
+    <Root>\01_Tools\mps; the path used is printed.
 .PARAMETER Root
     Working folder root. Default C:\MakoPS. Output goes to <Root>\04_MPS.
 .PARAMETER Year
@@ -38,22 +39,28 @@ param(
 # errors under Stop, and pip / openpyxl legitimately write warnings to stderr.
 $ErrorActionPreference = "Continue"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Absolute root: the .NET file test below resolves relative paths against the process directory, not the PowerShell location
+$Root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Root)
 
 $envFile = Join-Path $here "PythonEnv.ps1"
 if (-not (Test-Path -LiteralPath $envFile)) { throw "PythonEnv.ps1 not found next to this script: $envFile" }
 . $envFile
 
 # ---------------------------------------------------------------- locate the generator
+# The copies next to this script win over a deployed copy under <Root>, so a run from the repository
+# builds with the repository schema even when C:\MakoPS exists.
 $candidates = @(
-    (Join-Path $Root "01_Tools\mps\build_workbook.py"),
     (Join-Path $here "mps\build_workbook.py"),
-    (Join-Path (Split-Path -Parent $here) "mps\build_workbook.py")
+    (Join-Path (Split-Path -Parent $here) "mps\build_workbook.py"),
+    (Join-Path $Root "01_Tools\mps\build_workbook.py")
 )
 $generator = $null
 foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { $generator = $c; break } }
 if (-not $generator) { throw ("build_workbook.py not found. Looked in:`n  " + ($candidates -join "`n  ")) }
 $schema = Join-Path (Split-Path -Parent $generator) "schema\mps_schema.json"
 if (-not (Test-Path -LiteralPath $schema)) { throw "Schema not found next to the generator: $schema" }
+Write-Host "Using generator: $generator"
+Write-Host "Using schema:    $schema"
 
 $outDir = Join-Path $Root "04_MPS"
 if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }

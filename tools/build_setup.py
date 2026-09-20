@@ -50,7 +50,9 @@ HEADER = r'''<#
         03_Inspection    inspection_report.md plus one JSON per workbook
         04_MPS           MPS_<Year>.xlsx (blank) and MPS_<Year>_DEMO.xlsx (synthetic data)
     Then runs the audit and builds the MPS workbooks. Re-running is safe: files are overwritten,
-    nothing is deleted. Python 3 is installed for the current user when it is missing.
+    nothing is deleted. Python 3 is resolved once (installed for the current user when it is
+    missing); when that fails the audit and the build are skipped with a warning and the setup
+    still finishes, so the tooling is in place for a later run.
     Run from a normal PowerShell window: mapped drives such as X: are not visible in an
     elevated (Run as administrator) session.
 .PARAMETER Root
@@ -80,6 +82,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Absolute root: the .NET file writer below resolves relative paths against the process directory, not the PowerShell location
+$Root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Root)
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $utf8Bom   = New-Object System.Text.UTF8Encoding $true
 
@@ -131,8 +135,23 @@ if (-not $SkipCopy) {
     }
 }
 
+# ---------------------------------------------------------------- python (resolved once for both scripts below)
+$pyOk = $false
+if (-not ($SkipRun -and $SkipBuild)) {
+    Write-Host ""
+    . (Join-Path $Root "01_Tools\PythonEnv.ps1")
+    try {
+        $py = Resolve-Python
+        Write-Host "Using Python: $py"
+        $pyOk = $true
+    } catch {
+        Write-Warning $_.Exception.Message
+        Write-Warning "Inspection and workbook build skipped. Install Python 3, then run 01_Tools\Invoke-XlInspect.ps1 and 01_Tools\Build-MPS.ps1 from $Root."
+    }
+}
+
 # ---------------------------------------------------------------- run inspection
-if (-not $SkipRun) {
+if (-not $SkipRun -and $pyOk) {
     $runner = Join-Path $Root "01_Tools\Invoke-XlInspect.ps1"
     $books = @(Get-ChildItem -Path $sourceCopy -File -ErrorAction SilentlyContinue | Where-Object {
         $_.Extension -match '^\.(xlsx|xlsm|xlsb|xls|xltm|xltx)$' -and $_.Name -notlike '~$*'
@@ -143,7 +162,7 @@ if (-not $SkipRun) {
         Write-Host ""
         Write-Host "Running inspection"
         try {
-            & $runner -Source $sourceCopy -Out (Join-Path $Root "03_Inspection")
+            & $runner -Source $sourceCopy -Out (Join-Path $Root "03_Inspection") -NoInstall
         } catch {
             Write-Warning "Inspection failed: $($_.Exception.Message). Fix the cause and run $runner again."
         }
@@ -151,21 +170,26 @@ if (-not $SkipRun) {
         if (Test-Path $report) {
             Write-Host ""
             Write-Host "Inspection report: $report"
-            try { Start-Process explorer.exe (Join-Path $Root "03_Inspection") } catch { }
         }
     }
 }
 
 # ---------------------------------------------------------------- build MPS workbooks
-if (-not $SkipBuild) {
+if (-not $SkipBuild -and $pyOk) {
     $builder = Join-Path $Root "01_Tools\Build-MPS.ps1"
     Write-Host ""
     Write-Host "Building the MPS workbooks for $Year"
-    & $builder -Root $Root -Year $Year
+    try {
+        & $builder -Root $Root -Year $Year -NoInstall -NoOpen
+    } catch {
+        Write-Warning "Build failed: $($_.Exception.Message). Fix the cause and run $builder again."
+    }
 }
 
 Write-Host ""
 Write-Host "Setup finished. Tools are in $(Join-Path $Root '01_Tools'); see README.md there."
+# one Explorer window on the root, after everything has been written
+try { Start-Process explorer.exe $Root } catch { }
 '''
 
 

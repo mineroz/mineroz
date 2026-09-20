@@ -11,7 +11,9 @@
         03_Inspection    inspection_report.md plus one JSON per workbook
         04_MPS           MPS_<Year>.xlsx (blank) and MPS_<Year>_DEMO.xlsx (synthetic data)
     Then runs the audit and builds the MPS workbooks. Re-running is safe: files are overwritten,
-    nothing is deleted. Python 3 is installed for the current user when it is missing.
+    nothing is deleted. Python 3 is resolved once (installed for the current user when it is
+    missing); when that fails the audit and the build are skipped with a warning and the setup
+    still finishes, so the tooling is in place for a later run.
     Run from a normal PowerShell window: mapped drives such as X: are not visible in an
     elevated (Run as administrator) session.
 .PARAMETER Root
@@ -41,6 +43,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Absolute root: the .NET file writer below resolves relative paths against the process directory, not the PowerShell location
+$Root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Root)
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $utf8Bom   = New-Object System.Text.UTF8Encoding $true
 
@@ -96,6 +100,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import sys
 import time
@@ -137,6 +142,7 @@ BLOAT_MIN_ROWS = 10000  # declared rows above this, and > 2x the real used rows,
 # 'Sheet Name'!A1  or  SheetName!A1 ; skip [n]Sheet!A1 (external) and #REF!
 SHEET_REF_RE = re.compile(r"(?<![\]#A-Za-z0-9_\.])(?:'((?:[^']|'')+)'|([A-Za-z0-9_\.]+))!")
 EXT_INDEX_RE = re.compile(r"\[(\d+)\]")
+EXT_FILE_RE = re.compile(r"\[[^\]]*\.(xls[xmb]?|xla[m]?|xlt[xm]?|csv)\]", re.I)   # [Book.xlsx] style external path
 VBA_PROC_RE = re.compile(r"^\s*(?:Public\s+|Private\s+|Friend\s+)?(?:Static\s+)?(Sub|Function|Property\s+(?:Get|Let|Set))\s+([A-Za-z_][A-Za-z0-9_]*)", re.I | re.M)
 VBA_RISK_RE = re.compile(r"\b(Shell|Kill|CreateObject|GetObject|Application\.OnTime|SendKeys|Environ|FileCopy|RmDir|MkDir|Workbooks\.Open|ActiveWorkbook\.SaveAs|DisplayAlerts\s*=\s*False|On Error Resume Next|Sheets\([^)]*\)\.Delete|\.Delete)\b", re.I)
 
@@ -214,7 +220,8 @@ def parse_defined_names(wb_xml: ET.Element | None, sheets: list[dict]) -> list[d
             "scope": scope,
             "refers_to": ref,
             "broken": "#REF!" in ref,
-            "external": bool(EXT_INDEX_RE.search(ref)) or ("[" in ref and "]" in ref),
+            # a workbook index [1] or a file name in brackets; plain brackets are structured references (tblPlant[Date])
+            "external": bool(EXT_INDEX_RE.search(ref)) or bool(EXT_FILE_RE.search(ref)),
             "hidden": d.get("hidden") == "1",
             "builtin": name.startswith("_xlnm."),
         })
@@ -336,8 +343,9 @@ def sheet_rel_counts(zf: zipfile.ZipFile) -> dict[str, dict]:
             typ = r.get("Type", "").rsplit("/", 1)[-1]
             target = r.get("Target", "")
             if typ == "drawing":
-                dpath = "xl/" + target.replace("../", "")
-                drels = dpath.replace("drawings/", "drawings/_rels/") + ".rels"
+                # relative to xl/worksheets/ (../drawings/x.xml) or absolute in the package (/xl/drawings/x.xml, as openpyxl writes)
+                dpath = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/worksheets/" + target)
+                drels = posixpath.join(posixpath.dirname(dpath), "_rels", posixpath.basename(dpath) + ".rels")
                 if drels in names:
                     try:
                         for rr in ET.fromstring(zf.read(drels)).findall("rel:Relationship", NS):
@@ -843,16 +851,20 @@ $content_tools_PythonEnv_ps1 = @'
         . (Join-Path $here "PythonEnv.ps1")
 
     Functions:
-        Find-Python       path of the first real Python 3.8+ on this PC, or $null. Ignores the
-                          Microsoft Store stub under \Microsoft\WindowsApps\, checks PATH, the
-                          py launcher and the usual install folders (per-user, Program Files,
-                          C:\Python3x, Anaconda and Miniconda).
+        Find-Python       path of the first real Python 3.8+ on PATH or behind the py launcher,
+                          otherwise the newest one in the usual install folders (per-user,
+                          Program Files, C:\Python3x, Anaconda and Miniconda), or $null. Every
+                          candidate is probed for its version; the Microsoft Store stub under
+                          \Microsoft\WindowsApps\ fails that probe (exit code 9009) and is
+                          skipped, while a real Store Python at the same path is accepted.
         Install-Python    installs Python 3.12 for the current user from python.org, silently
-                          (InstallAllUsers=0 PrependPath=1, no admin rights), with winget as
-                          fallback, then refreshes PATH for the running session.
+                          (InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1, no admin
+                          rights, through the Windows proxy when one is configured), with winget
+                          as fallback, then refreshes PATH for the running session.
         Test-PyModule     $true when the given interpreter can import the module.
-        Ensure-PyModules  pip installs each missing module, retrying with --user, and throws
-                          with a manual command when a module still cannot be imported.
+        Ensure-PyModules  pip installs each missing module (passing the Windows proxy when one
+                          applies), retrying with --user, and throws with a manual command when
+                          a module still cannot be imported.
         Resolve-Python    Find-Python, then Install-Python unless -NoInstall, then Find-Python
                           again. Returns the interpreter path or throws.
 
@@ -868,8 +880,9 @@ function Test-RealPython {
     param([string]$Exe)
     $ErrorActionPreference = "Continue"
     if ([string]::IsNullOrWhiteSpace($Exe)) { return $false }
-    if ($Exe -like "*\Microsoft\WindowsApps\*") { return $false }   # Store stub: prints a message and exits 9009
     if (-not (Test-Path -LiteralPath $Exe)) { return $false }
+    # The Microsoft Store stub (python.exe under \Microsoft\WindowsApps\) prints a message and exits 9009 when
+    # given arguments, so the exit code test below rejects it; a real Store Python at the same path passes.
     $v = $null
     try { $v = & $Exe -c "import sys; print(sys.version_info[0]*100 + sys.version_info[1])" 2>$null }
     catch { return $false }
@@ -886,7 +899,7 @@ function Find-Python {
         Get-Command $name -All -ErrorAction SilentlyContinue | ForEach-Object { $candidates.Add($_.Source) }
     }
     $pyl = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($pyl -and $pyl.Source -notlike "*\Microsoft\WindowsApps\*") {
+    if ($pyl) {
         $resolved = $null
         try { $resolved = & $pyl.Source -3 -c "import sys; print(sys.executable)" 2>$null } catch { }
         if ($LASTEXITCODE -eq 0 -and $resolved) { $candidates.Add(("$resolved").Trim()) }
@@ -902,23 +915,49 @@ function Find-Python {
         "$env:ProgramData\anaconda3\python.exe"
     )
     foreach ($g in $globs) {
-        Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | ForEach-Object { $candidates.Add($_.FullName) }
+        # newest first by the file version resource, not by name (a name sort puts Python39 above Python312)
+        Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Sort-Object { $_.VersionInfo.FileVersionRaw } -Descending | ForEach-Object { $candidates.Add($_.FullName) }
     }
     foreach ($c in $candidates) { if (Test-RealPython $c) { return $c } }
     return $null
 }
 
+function Use-SystemProxy {
+    # Windows PowerShell 5.1 uses the proxy from Internet Options but sends it no credentials, so an
+    # authenticating site proxy answers 407. Attach the current user's credentials to the default proxy.
+    try {
+        $proxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        $proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        [System.Net.WebRequest]::DefaultWebProxy = $proxy
+    } catch { }
+}
+
+function Get-PipProxyArgs {
+    # pip reads a static proxy from Internet Options but not a proxy script (PAC). Resolve the proxy
+    # Windows would use for PyPI and return it as pip arguments, or an empty array for a direct connection.
+    try {
+        $target = [uri]"https://pypi.org/"
+        $p = [System.Net.WebRequest]::GetSystemWebProxy().GetProxy($target)
+        if ($p -and $p.Host -ne $target.Host) { return @("--proxy", $p.AbsoluteUri) }
+    } catch { }
+    return @()
+}
+
 function Install-Python {
     param([string]$Version = "3.12.10")   # last 3.12 release with a Windows installer
     $ErrorActionPreference = "Continue"
+    $ProgressPreference = "SilentlyContinue"   # the 5.1 progress bar makes Invoke-WebRequest many times slower
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
     $url = "https://www.python.org/ftp/python/$Version/python-$Version-$arch.exe"
     $installer = Join-Path $env:TEMP "python-$Version-$arch.exe"
-    Write-Host "Python 3 not found. Installing Python $Version for the current user (no admin rights, about 100 MB, 1-2 minutes) ..."
+    Write-Host "Python 3 not found. Installing Python $Version for the current user (no admin rights, 25 MB download, about 100 MB installed, 1-2 minutes) ..."
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Use-SystemProxy
         Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -ErrorAction Stop
-        $p = Start-Process -FilePath $installer -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0 Include_doc=0" -Wait -PassThru
+        # InstallLauncherAllUsers=0: the py launcher defaults to a per-machine component, which asks for
+        # elevation even in a per-user /quiet install.
+        $p = Start-Process -FilePath $installer -ArgumentList "/quiet InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0 Include_doc=0" -Wait -PassThru
         # 0 = ok, 3010 = ok but a restart is pending
         if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "installer exit code $($p.ExitCode)" }
         Write-Host "Python installed."
@@ -929,8 +968,9 @@ function Install-Python {
         & $wg.Source install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements 2>&1 | ForEach-Object { Write-Host "  $_" }
         if ($LASTEXITCODE -ne 0) { throw "winget install failed with exit code $LASTEXITCODE. Install Python 3 manually from https://www.python.org/downloads/windows/ and re-run." }
     }
-    # refresh PATH for this session so the new interpreter is visible without opening a new window
-    $env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
+    # refresh PATH for this session so the new interpreter is visible without opening a new window;
+    # Machine then User as in a fresh window, and the entries this process already had are kept
+    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User") + ";" + $env:Path
 }
 
 function Test-PyModule {
@@ -945,15 +985,18 @@ function Test-PyModule {
 function Ensure-PyModules {
     param([string]$Python, [string[]]$Modules)
     $ErrorActionPreference = "Continue"
+    $proxyArgs = @(Get-PipProxyArgs)
     foreach ($m in $Modules) {
         if (Test-PyModule $Python $m) { continue }
         Write-Host "Installing Python package $m ..."
-        & $Python -m pip install --quiet --disable-pip-version-check $m 2>&1 | ForEach-Object { Write-Host "  $_" }
+        if ($proxyArgs.Count -gt 0) { Write-Host "  via proxy $($proxyArgs[1])" }
+        & $Python -m pip install --quiet --disable-pip-version-check @proxyArgs $m 2>&1 | ForEach-Object { Write-Host "  $_" }
         if (-not (Test-PyModule $Python $m)) {
-            & $Python -m pip install --quiet --disable-pip-version-check --user $m 2>&1 | ForEach-Object { Write-Host "  $_" }
+            & $Python -m pip install --quiet --disable-pip-version-check --user @proxyArgs $m 2>&1 | ForEach-Object { Write-Host "  $_" }
         }
         if (-not (Test-PyModule $Python $m)) {
-            throw "Could not install Python package '$m'. Install it manually:  `"$Python`" -m pip install $m"
+            $manual = (@("`"$Python`"", "-m", "pip", "install") + $proxyArgs + @($m)) -join " "
+            throw "Could not install Python package '$m'. Install it manually:  $manual"
         }
     }
 }
@@ -1026,6 +1069,12 @@ if ([string]::IsNullOrWhiteSpace($Out)) {
     if (Test-Path (Join-Path $root "02_Source")) { $Out = Join-Path $root "03_Inspection" }
     else { $Out = Join-Path $Source "_inspection" }
 }
+# Absolute paths without a trailing backslash: Windows PowerShell 5.1 hands 'D:\Ops Reports\' to python.exe
+# as "D:\Ops Reports\" and the C runtime reads \" as a literal quote, which swallows the next argument.
+$Source = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Source)
+$Out = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out)
+if ($Source -notmatch '^[A-Za-z]:\\$') { $Source = $Source.TrimEnd('\') }
+if ($Out -notmatch '^[A-Za-z]:\\$') { $Out = $Out.TrimEnd('\') }
 
 # ---------------------------------------------------------------- python and packages
 $py = Resolve-Python -NoInstall:$NoInstall
@@ -1055,8 +1104,9 @@ $content_tools_Build_MPS_ps1 = @'
         <Root>\04_MPS\MPS_<Year>_DEMO.xlsx   the same workbook with <SampleDays> days of synthetic DEMO data
 
     Existing files are overwritten, so close them in Excel before re-running. The generator is
-    looked up at <Root>\01_Tools\mps\build_workbook.py (C:\MakoPS layout); when this script runs
-    from the repository, <repo>\mps\build_workbook.py is used instead.
+    looked up next to this script first (<Root>\01_Tools\mps\build_workbook.py in the C:\MakoPS
+    layout, <repo>\mps\build_workbook.py when this script runs from the repository), then under
+    <Root>\01_Tools\mps; the path used is printed.
 .PARAMETER Root
     Working folder root. Default C:\MakoPS. Output goes to <Root>\04_MPS.
 .PARAMETER Year
@@ -1084,22 +1134,28 @@ param(
 # errors under Stop, and pip / openpyxl legitimately write warnings to stderr.
 $ErrorActionPreference = "Continue"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Absolute root: the .NET file test below resolves relative paths against the process directory, not the PowerShell location
+$Root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Root)
 
 $envFile = Join-Path $here "PythonEnv.ps1"
 if (-not (Test-Path -LiteralPath $envFile)) { throw "PythonEnv.ps1 not found next to this script: $envFile" }
 . $envFile
 
 # ---------------------------------------------------------------- locate the generator
+# The copies next to this script win over a deployed copy under <Root>, so a run from the repository
+# builds with the repository schema even when C:\MakoPS exists.
 $candidates = @(
-    (Join-Path $Root "01_Tools\mps\build_workbook.py"),
     (Join-Path $here "mps\build_workbook.py"),
-    (Join-Path (Split-Path -Parent $here) "mps\build_workbook.py")
+    (Join-Path (Split-Path -Parent $here) "mps\build_workbook.py"),
+    (Join-Path $Root "01_Tools\mps\build_workbook.py")
 )
 $generator = $null
 foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { $generator = $c; break } }
 if (-not $generator) { throw ("build_workbook.py not found. Looked in:`n  " + ($candidates -join "`n  ")) }
 $schema = Join-Path (Split-Path -Parent $generator) "schema\mps_schema.json"
 if (-not (Test-Path -LiteralPath $schema)) { throw "Schema not found next to the generator: $schema" }
+Write-Host "Using generator: $generator"
+Write-Host "Using schema:    $schema"
 
 $outDir = Join-Path $Root "04_MPS"
 if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
@@ -1201,6 +1257,14 @@ param(
 
 # No native commands run here, so Stop is safe and makes every COM failure land in the catch/finally blocks.
 $ErrorActionPreference = "Stop"
+
+# Excel COM binds through the thread culture. A Windows regional format with no matching Office
+# language (for example French (Senegal) with English Office) raises 0x80028018, "Old format or
+# invalid type library", on the first property set. en-US also keeps English day and month names
+# in the file name and the mail subject.
+$culture = [System.Globalization.CultureInfo]::GetCultureInfo("en-US")
+[System.Threading.Thread]::CurrentThread.CurrentCulture = $culture
+[System.Threading.Thread]::CurrentThread.CurrentUICulture = $culture
 
 $Date = $Date.Date
 if ([string]::IsNullOrWhiteSpace($Workbook)) { $Workbook = Join-Path $Root ("04_MPS\MPS_{0}.xlsx" -f $Date.Year) }
@@ -1335,10 +1399,10 @@ parameters of its own.
 
 | Function | Purpose |
 |---|---|
-| `Find-Python` | first real Python 3.8+ on the PC: PATH, the `py` launcher, per-user and Program Files installs, Anaconda and Miniconda. The Microsoft Store stub under `\Microsoft\WindowsApps\` is ignored. |
-| `Install-Python` | silent per-user install of Python 3.12 from python.org (`InstallAllUsers=0 PrependPath=1`, no admin rights), winget as fallback, then refreshes PATH for the running session |
+| `Find-Python` | first real Python 3.8+ on PATH or behind the `py` launcher, otherwise the newest one in the per-user and Program Files install folders, Anaconda and Miniconda. Every candidate is probed for its version, which rejects the Microsoft Store stub (exit code 9009) but accepts a real Store Python. |
+| `Install-Python` | silent per-user install of Python 3.12 from python.org (`InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1`, no admin rights, through the Windows proxy with the user's credentials), winget as fallback, then refreshes PATH for the running session |
 | `Test-PyModule` | `$true` when the interpreter can import a module |
-| `Ensure-PyModules` | `pip install` of each missing module, retried with `--user`, with a manual command in the error when that fails too |
+| `Ensure-PyModules` | `pip install` of each missing module (with `--proxy` when Windows routes PyPI through a proxy), retried with `--user`, with a manual command in the error when that fails too |
 | `Resolve-Python` | `Find-Python`, then `Install-Python` unless `-NoInstall`, then `Find-Python` again |
 
 The functions run native executables, so they set `$ErrorActionPreference = "Continue"` in
@@ -1458,6 +1522,10 @@ python tools/build_setup.py --check    # only verify the existing Setup-MakoPS.p
 The verification extracts every here-string from the generated file and compares it with its
 source, the target path and the BOM flag. Re-run the build after changing any embedded file.
 `Setup-MakoPS.ps1` accepts `-Root`, `-Source`, `-Year`, `-SkipCopy`, `-SkipRun` and `-SkipBuild`.
+It resolves Python once (installing it when missing) and passes `-NoInstall` to the two child
+scripts; when Python cannot be resolved the audit and the build are skipped with a warning and
+the setup still finishes. The audit and the build run in try/catch blocks, so one failure does
+not stop the other, and a single Explorer window is opened on the root at the end.
 
 ## Conventions
 
@@ -1492,6 +1560,7 @@ import argparse
 import calendar
 import json
 import random
+import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -1499,10 +1568,12 @@ from pathlib import Path
 import openpyxl
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.axis import DateAxis
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.pagebreak import Break
 from openpyxl.worksheet.properties import PageSetupProperties
 from openpyxl.worksheet.table import Table, TableFormula, TableStyleInfo
 
@@ -1517,6 +1588,7 @@ C_LABEL = "F2F2F2"       # label row
 C_SECTION = "D9E1F2"     # report section band
 C_INPUT_CELL = "FFFFFF"
 C_KEY = "FFF2CC"         # report date input
+C_WARN = "FFC7CE"        # conditional highlight: missing or unknown value
 TAB = {"report": "2F5597", "input": "548235", "config": "7F7F7F", "calc": "3A3A3A"}
 
 FMT = {
@@ -1525,6 +1597,12 @@ FMT = {
     "m3/t": "0.00", "ratio": "0.00", "rate": "0.00", "days": "0", "int": "0", "date": "dd-mmm-yyyy", "text": "@", "number": "#,##0.00",
 }
 TROY = "cfg_TroyOz"
+# schema constants exposed as named Config cells; {NAME} placeholders in table calcs and KPI formulas resolve to the name
+CONSTANTS = {"TROY_OZ_G": ("cfg_TroyOz", "Troy ounce (g)"),
+             "HOURS_PER_DAY": ("cfg_HoursPerDay", "Hours per day (fleet and mill calendar hours)"),
+             "RATE_BASIS_HOURS": ("cfg_RateBasisHours", "Injury rate basis, hours (TRIFR and LTIFR are injuries per this many hours)")}
+PLACEHOLDERS = {"TROY": TROY, **{k: v[0] for k, v in CONSTANTS.items()}}
+DEFAULT_DATE_FORMULA = "=MAX(cfg_YearStart,MIN(TODAY()-1,cfg_YearEnd,IF(N(cfg_LastDataDate)>0,cfg_LastDataDate,cfg_YearEnd)))"
 
 thin = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -1536,6 +1614,24 @@ def font(bold=False, color="000000", size=10, italic=False):
 
 def fill(hex_):
     return PatternFill("solid", start_color=hex_, end_color=hex_)
+
+
+def const_subst(expr: str) -> str:
+    """Replace {TROY}, {HOURS_PER_DAY}, {RATE_BASIS_HOURS} with their Config names."""
+    for k, v in PLACEHOLDERS.items():
+        expr = expr.replace("{" + k + "}", v)
+    return expr
+
+
+def num_text(v) -> str:
+    """Number as Excel formula text: 5000000 not 5000000.0."""
+    return str(int(v)) if float(v).is_integer() else str(v)
+
+
+def xl_date_text(expr: str) -> str:
+    """Locale-independent 'dd Mon yyyy' text for a date expression (TEXT() format letters change with the Excel UI language)."""
+    return (f'DAY({expr})&" "&CHOOSE(MONTH({expr}),"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")'
+            f'&" "&YEAR({expr})')
 
 
 # ----------------------------------------------------------------------------- KPI catalogue
@@ -1561,12 +1657,20 @@ KPIS = [
     # ---- mining
     K("Ore_Mined_t", "Ore mined (ex-pit)", "t", "sum", day=sumifs("tblMovement", "Tonnes_t", ("Is_Ore", "1"), ("Source_Type", '"Pit"')), budget="Ore_Mined_t"),
     K("Ore_Mined_oz", "Contained gold mined", "oz", "sum", day=sumifs("tblMovement", "Ore_oz", ("Source_Type", '"Pit"')), budget="Ore_oz"),
-    K("Ore_Grade_gpt", "Ore grade mined", "g/t", "ratio", num="{Ore_Mined_oz}*" + TROY, den="{Ore_Mined_t}"),
+    # graded ore tonnes carry the grade denominator so an ore row entered before its grade does not dilute the grade;
+    # budget alias keeps the derived grade budget (the budget assumes every budgeted tonne is graded)
+    K("Ore_Graded_t", "Ore mined with a grade (grade basis)", "t", "sum",
+      day=sumifs("tblMovement", "Tonnes_t", ("Is_Ore", "1"), ("Source_Type", '"Pit"'), ("Grade_gpt", '"<>"')), budget="Ore_Mined_t"),
+    K("Ore_Grade_gpt", "Ore grade mined", "g/t", "ratio", num="{Ore_Mined_oz}*" + TROY, den="{Ore_Graded_t}"),
+    K("Ore_Ungraded_t", "Ore mined without a grade (check)", "t", "sum", day="{Ore_Mined_t}-{Ore_Graded_t}"),
     K("Waste_t", "Waste mined", "t", "sum", day=sumifs("tblMovement", "Tonnes_t", ("Is_Ore", "0"), ("Source_Type", '"Pit"')), budget="Waste_t"),
     K("TMM_t", "Total material moved", "t", "sum", day="{Ore_Mined_t}+{Waste_t}", budget="TMM_t"),
     K("Strip_Ratio", "Strip ratio (waste : ore)", "ratio", "ratio", num="{Waste_t}", den="{Ore_Mined_t}"),
     K("Rehandle_t", "Rehandle from stockpiles", "t", "sum", day=sumifs("tblMovement", "Tonnes_t", ("Source_Type", '"Stockpile"'))),
+    K("Moved_Total_t", "Total tonnes moved (all movement rows)", "t", "sum", day=sumifs("tblMovement", "Tonnes_t")),
+    K("Unclassified_t", "Movements with unknown source type (check)", "t", "sum", day="{Moved_Total_t}-{TMM_t}-{Rehandle_t}"),
     K("Drill_m", "Drilled", "m", "sum", day=sumifs("tblMiningDaily", "Drill_m"), budget="Drill_m"),
+    K("GC_Drill_m", "Grade control drilled", "m", "sum", day=sumifs("tblMiningDaily", "GC_Drill_m")),
     K("Blast_t", "Blasted", "t", "sum", day=sumifs("tblMiningDaily", "Blast_t")),
     K("Explosives_kg", "Explosives", "kg", "sum", day=sumifs("tblMiningDaily", "Explosives_kg")),
     K("Powder_Factor_kgpt", "Powder factor", "kg/t", "ratio", num="{Explosives_kg}", den="{Blast_t}"),
@@ -1582,23 +1686,35 @@ KPIS = [
     K("Trk_Operating_h", "Truck operating hours", "h", "sum", day=sumifs("tblFleet", "Operating_h", ("Equipment_Class", '"Haul Truck"'))),
     K("Trk_Availability_pct", "Truck availability", "%", "ratio", num="{Trk_Available_h}", den="{Trk_Calendar_h}"),
     K("Trk_Utilisation_pct", "Truck utilisation", "%", "ratio", num="{Trk_Operating_h}", den="{Trk_Available_h}"),
+    K("Exc_Productivity_tph", "Excavator productivity (TMM + rehandle)", "t/h", "ratio", num="{TMM_t}+{Rehandle_t}", den="{Exc_Operating_h}"),
+    K("Trk_Productivity_tph", "Truck productivity (TMM + rehandle)", "t/h", "ratio", num="{TMM_t}+{Rehandle_t}", den="{Trk_Operating_h}"),
     # ---- processing
     K("Crushed_t", "Crushed", "t", "sum", day=sumifs("tblPlant", "Crushed_t")),
     K("Milled_t", "Milled", "t", "sum", day=sumifs("tblPlant", "Milled_t"), budget="Milled_t"),
     K("Feed_oz", "Contained gold in feed", "oz", "sum", day=sumifs("tblPlant", "Feed_oz"), budget="Feed_oz"),
     K("Tails_oz", "Gold lost to tails", "oz", "sum", day=sumifs("tblPlant", "Tails_oz")),
     K("Recovered_oz", "Gold recovered", "oz", "sum", day=sumifs("tblPlant", "Recovered_oz"), budget="Recovered_oz"),
-    K("Head_Grade_gpt", "Head grade", "g/t", "ratio", num="{Feed_oz}*" + TROY, den="{Milled_t}"),
-    K("Tails_Grade_gpt", "Tails grade", "g/t", "ratio", num="{Tails_oz}*" + TROY, den="{Milled_t}"),
-    K("Recovery_pct", "Recovery", "%", "ratio", num="{Recovered_oz}", den="{Feed_oz}"),
+    # period grades and recovery are paired with the tonnes that carry the assay, so a day whose head or tails grade
+    # is still outstanding is left out of the ratio instead of counting as zero grade or 100 percent recovery;
+    # budget aliases keep the derived budgets (the budget has no blank days)
+    K("Milled_Graded_t", "Milled with a head grade (head grade basis)", "t", "sum", day=sumifs("tblPlant", "Milled_t", ("Head_Grade_gpt", '"<>"')), budget="Milled_t"),
+    K("Milled_Tails_Graded_t", "Milled with a tails grade (tails grade basis)", "t", "sum", day=sumifs("tblPlant", "Milled_t", ("Tails_Grade_gpt", '"<>"'))),
+    K("Feed_Recon_oz", "Contained gold in feed on days with a tails grade (recovery basis)", "oz", "sum", day=sumifs("tblPlant", "Feed_oz", ("Tails_Grade_gpt", '"<>"')), budget="Feed_oz"),
+    K("Milled_Timed_t", "Milled on days with run hours (throughput basis)", "t", "sum", day=sumifs("tblPlant", "Milled_t", ("Mill_Run_h", '"<>"'))),
+    K("Head_Grade_gpt", "Head grade", "g/t", "ratio", num="{Feed_oz}*" + TROY, den="{Milled_Graded_t}"),
+    K("Tails_Grade_gpt", "Tails grade", "g/t", "ratio", num="{Tails_oz}*" + TROY, den="{Milled_Tails_Graded_t}"),
+    K("Recovery_pct", "Recovery", "%", "ratio", num="{Recovered_oz}", den="{Feed_Recon_oz}"),
     K("Gravity_Gold_oz", "Gravity gold", "oz", "sum", day=sumifs("tblPlant", "Gravity_Gold_oz")),
+    K("Gravity_Share_pct", "Gravity share of gold recovered", "%", "ratio", num="{Gravity_Gold_oz}", den="{Recovered_oz}"),
     K("Gold_Poured_oz", "Gold poured", "oz", "sum", day=sumifs("tblPlant", "Gold_Poured_oz"), budget="Gold_Poured_oz"),
     K("Mill_Run_h", "Mill run hours", "h", "sum", day=sumifs("tblPlant", "Mill_Run_h")),
     K("Mill_Planned_Maint_h", "Mill planned maintenance", "h", "sum", day=sumifs("tblPlant", "Mill_Planned_Maint_h")),
     K("Mill_Unplanned_Down_h", "Mill unplanned downtime", "h", "sum", day=sumifs("tblPlant", "Mill_Unplanned_Down_h")),
-    K("Mill_Calendar_h", "Mill calendar hours (days reported)", "h", "sum", day='COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Run_h],"<>")*24'),
+    K("Mill_Calendar_h", "Mill calendar hours (days with any mill hours entered)", "h", "sum",
+      day='IF(COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Run_h],"<>")+COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Planned_Maint_h],"<>")'
+          '+COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Unplanned_Down_h],"<>")>0,{HOURS_PER_DAY},0)'),
     K("Crusher_Run_h", "Crusher run hours", "h", "sum", day=sumifs("tblPlant", "Crusher_Run_h")),
-    K("Throughput_tph", "Mill throughput", "t/h", "ratio", num="{Milled_t}", den="{Mill_Run_h}"),
+    K("Throughput_tph", "Mill throughput", "t/h", "ratio", num="{Milled_Timed_t}", den="{Mill_Run_h}"),
     K("Mill_Availability_pct", "Mill availability", "%", "ratio", num="{Mill_Calendar_h}-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h}", den="{Mill_Calendar_h}"),
     K("Mill_Utilisation_pct", "Mill utilisation", "%", "ratio", num="{Mill_Run_h}", den="{Mill_Calendar_h}-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h}"),
     K("Cyanide_kg", "Cyanide", "kg", "sum", day=sumifs("tblPlant", "Cyanide_kg")),
@@ -1632,16 +1748,18 @@ KPIS = [
     K("Vehicle_Incidents", "Vehicle incidents", "int", "sum", day=sumifs("tblSafety", "Vehicle_Incidents")),
     K("Toolbox_Talks", "Toolbox talks", "int", "sum", day=sumifs("tblSafety", "Toolbox_Talks")),
     K("Inspections", "Inspections and audits", "int", "sum", day=sumifs("tblSafety", "Inspections")),
+    # rolling window: daily rows for the last 12 months plus month to date; history months fill any month in the
+    # window before the current month that has no daily hours (prior year, or this year before go-live)
     K("TRIFR_12m", "TRIFR, rolling 12 months + MTD", "rate", "custom",
       day='IFERROR((SUMIFS(tblSafety[Recordables],tblSafety[Date],">="&EDATE({ms},-12),tblSafety[Date],"<="&{d})'
-          '+SUMIFS(tblSafetyHistory[Recordables],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&cfg_YearStart))'
+          '+SUMIFS(tblSafetyHistory[Recordables],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))'
           '/(SUMIFS(tblSafety[Hours_Total],tblSafety[Date],">="&EDATE({ms},-12),tblSafety[Date],"<="&{d})'
-          '+SUMIFS(tblSafetyHistory[Hours_Total],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&cfg_YearStart))*1000000,"")'),
+          '+SUMIFS(tblSafetyHistory[Hours_Total],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))*{RATE_BASIS_HOURS},"")'),
     K("LTIFR_12m", "LTIFR, rolling 12 months + MTD", "rate", "custom",
       day='IFERROR((SUMIFS(tblSafety[LTI],tblSafety[Date],">="&EDATE({ms},-12),tblSafety[Date],"<="&{d})'
-          '+SUMIFS(tblSafetyHistory[LTI],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&cfg_YearStart))'
+          '+SUMIFS(tblSafetyHistory[LTI],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))'
           '/(SUMIFS(tblSafety[Hours_Total],tblSafety[Date],">="&EDATE({ms},-12),tblSafety[Date],"<="&{d})'
-          '+SUMIFS(tblSafetyHistory[Hours_Total],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&cfg_YearStart))*1000000,"")'),
+          '+SUMIFS(tblSafetyHistory[Hours_Total],tblSafetyHistory[Month],">="&EDATE({ms},-12),tblSafetyHistory[Month],"<"&{ms},tblSafetyHistory[Use],1))*{RATE_BASIS_HOURS},"")'),
     K("Days_Since_LTI", "Days since last LTI", "days", "custom",
       day='IF(MAX(N(cfg_PriorLTIDate),_xlfn.MAXIFS(tblSafety[Date],tblSafety[LTI],">0",tblSafety[Date],"<="&{d}))=0,"",'
           '{d}-MAX(N(cfg_PriorLTIDate),_xlfn.MAXIFS(tblSafety[Date],tblSafety[LTI],">0",tblSafety[Date],"<="&{d})))'),
@@ -1653,18 +1771,21 @@ REPORT_LAYOUT = [
     ("SAFETY", [("Hours_Worked", True), ("Recordables", False), ("LTI", False), ("RWI", False), ("MTI", False), ("FAI", False),
                 ("Near_Miss", False), ("Hazard_Reports", False), ("HPI", False), ("Env_Incidents", False), ("Community_Incidents", False),
                 ("Vehicle_Incidents", False), ("TRIFR_12m", False), ("LTIFR_12m", False), ("Days_Since_LTI", False)]),
-    ("MINING", [("Ore_Mined_t", True), ("Ore_Grade_gpt", True), ("Ore_Mined_oz", True), ("Waste_t", True), ("TMM_t", True), ("Strip_Ratio", True),
-                ("Rehandle_t", False), ("Drill_m", True), ("Blast_t", False), ("Powder_Factor_kgpt", False), ("Diesel_Mining_L", True),
-                ("Exc_Availability_pct", False), ("Exc_Utilisation_pct", False), ("Trk_Availability_pct", False), ("Trk_Utilisation_pct", False)]),
+    ("MINING", [("Ore_Mined_t", True), ("Ore_Grade_gpt", True), ("Ore_Mined_oz", True), ("Ore_Ungraded_t", False), ("Waste_t", True), ("TMM_t", True),
+                ("Strip_Ratio", True), ("Rehandle_t", False), ("Unclassified_t", False), ("Drill_m", True), ("GC_Drill_m", False), ("Blast_t", False), ("Powder_Factor_kgpt", False), ("Diesel_Mining_L", True),
+                ("Exc_Availability_pct", False), ("Exc_Utilisation_pct", False), ("Exc_Productivity_tph", False),
+                ("Trk_Availability_pct", False), ("Trk_Utilisation_pct", False), ("Trk_Productivity_tph", False)]),
     ("PROCESSING", [("Crushed_t", False), ("Milled_t", True), ("Head_Grade_gpt", True), ("Feed_oz", True), ("Recovery_pct", True), ("Recovered_oz", True),
-                    ("Gravity_Gold_oz", False), ("Gold_Poured_oz", True), ("Throughput_tph", False), ("Mill_Run_h", False), ("Mill_Availability_pct", False),
+                    ("Gravity_Gold_oz", False), ("Gravity_Share_pct", False), ("Gold_Poured_oz", True), ("Throughput_tph", False), ("Mill_Run_h", False), ("Mill_Availability_pct", False),
                     ("Mill_Utilisation_pct", False), ("Cyanide_kgpt", False), ("Lime_kgpt", False), ("Power_kWhpt", False), ("GIC_oz", False)]),
     ("GOLD", [("Gold_Shipped_oz", False), ("Gold_Sold_oz", False), ("Dore_Shipped_kg", False)]),
 ]
 MONTHLY_KPIS = ["Hours_Worked", "Recordables", "LTI", "TRIFR_12m", "Ore_Mined_t", "Ore_Grade_gpt", "Ore_Mined_oz", "Waste_t", "TMM_t", "Strip_Ratio",
                 "Drill_m", "Milled_t", "Head_Grade_gpt", "Recovery_pct", "Recovered_oz", "Gold_Poured_oz", "Gold_Sold_oz", "Throughput_tph",
                 "Mill_Availability_pct", "Mill_Utilisation_pct", "Cyanide_kgpt", "Power_kWhpt"]
+PAGE_BREAK_BEFORE = "PROCESSING"   # Daily_Report prints on two portrait pages
 COMMENT_LINES = 15
+COMMENT_ROW_PT = 36               # three lines of 9 pt text per comment; rows stay resizable on the protected sheet
 
 
 # ----------------------------------------------------------------------------- builder
@@ -1688,8 +1809,10 @@ class Builder:
         self.wb.defined_names[nm] = DefinedName(nm, attr_text=ref)
 
     def dyn_range(self, sheet: str, col_letter: str, first_row: int) -> str:
+        """Dynamic range from the first data row to the last non-empty cell; counts from the first data row only,
+        so the title, label and header cells above the list do not shorten it."""
         c = col_letter
-        return f"{sheet}!${c}${first_row}:INDEX({sheet}!${c}:${c},COUNTA({sheet}!${c}:${c}))"
+        return f"{sheet}!${c}${first_row}:INDEX({sheet}!${c}:${c},{first_row - 1}+COUNTA({sheet}!${c}${first_row}:${c}$1048576))"
 
     def set_widths(self, ws, widths: dict):
         for col, w in widths.items():
@@ -1716,17 +1839,23 @@ class Builder:
 
     def tbl_formula(self, tbl: str, expr: str) -> str:
         """Translate {Col} placeholders into table this-row references."""
-        out = expr.replace("{TROY}", TROY)
-        import re
+        out = const_subst(expr)
         return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: f"{tbl}[[#This Row],[{m.group(1)}]]", out)
+
+    def a1_formula(self, expr: str, cols: dict, row: int) -> str:
+        """Translate {Col} placeholders into A1 references on one row (conditional formats cannot use table references)."""
+        out = const_subst(expr)
+        return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: f"${cols[m.group(1)]}{row}", out)
 
     # ---- tables ------------------------------------------------------------------
     def prefill_rows(self, tdef: dict) -> int:
         p = tdef.get("prefill")
         if p == "dates":
             return len(self.days)
-        if p in ("months", "prior_months"):
+        if p == "months":
             return 12
+        if p == "prior_months":
+            return 24   # prior year and reporting year (months before go-live)
         return int(tdef.get("rows", 100))
 
     def write_table(self, ws, tdef: dict, anchor_col: int = 1, anchor_row: int = 1, data: list[list] | None = None, style="TableStyleMedium2"):
@@ -1763,7 +1892,7 @@ class Builder:
             elif p == "months":
                 ws.cell(r, anchor_col, date(self.year, i + 1, 1))
             elif p == "prior_months":
-                ws.cell(r, anchor_col, date(self.year - 1, i + 1, 1))
+                ws.cell(r, anchor_col, date(self.year - 1 + i // 12, i % 12 + 1, 1))
         if data:
             by_key = {}
             if p in ("dates", "months", "prior_months"):
@@ -1796,10 +1925,21 @@ class Builder:
                     cell.font = font(color="595959")
                     self.formula_count += 1
             if not calc:
-                dv = self.dv_for(f)
+                dv = self.dv_for(f, tdef, L, first, last)
                 if dv is not None:
                     ws.add_data_validation(dv)
                     dv.add(f"{L}{first}:{L}{last}")
+            # conditional highlights (schema-driven): a value required under a condition, a warning condition,
+            # and a duplicated key in a prefilled table (paste bypasses data validation)
+            rules = []
+            if f.get("required_when"):
+                rules.append(f'AND({self.a1_formula(f["required_when"], cols, first)},${L}{first}="")')
+            if f.get("warn_when"):
+                rules.append(self.a1_formula(f["warn_when"], cols, first))
+            if f.get("key") and p in ("dates", "months", "prior_months"):
+                rules.append(f"COUNTIF(${L}${first}:${L}${last},${L}{first})>1")
+            for rule in rules:
+                ws.conditional_formatting.add(f"{L}{first}:{L}{last}", FormulaRule(formula=[rule], fill=fill(C_WARN), font=Font(color="9C0006")))
         ref = f"{get_column_letter(anchor_col)}{hdr_row}:{get_column_letter(anchor_col + len(fields) - 1)}{last}"
         t = Table(displayName=tbl, ref=ref)
         t.tableStyleInfo = TableStyleInfo(name=style, showRowStripes=True, showFirstColumn=False, showLastColumn=False, showColumnStripes=False)
@@ -1813,24 +1953,37 @@ class Builder:
         self.tables[tbl] = info
         return info
 
-    def dv_for(self, f: dict):
+    def dv_for(self, f: dict, tdef: dict | None = None, L: str = "", first: int = 0, last: int = 0):
         t = f.get("type")
         msg = f.get("desc", "")
-        if t == "list" and f.get("list"):
+        prefill = (tdef or {}).get("prefill")
+        if f.get("key") and prefill in ("dates", "months", "prior_months") and L:
+            # prefilled key column: the only realistic error is a duplicated day or month, which SUMIFS would double count
+            dv = DataValidation(type="custom", formula1=f"COUNTIF(${L}${first}:${L}${last},{L}{first})=1", allow_blank=True,
+                                showErrorMessage=True, errorStyle="stop", showInputMessage=bool(msg))
+            dv.errorTitle = "Duplicate date"
+            dv.error = "This date already has a row in the table. Enter the values on the existing row."
+        elif t == "list" and f.get("list"):
             dv = DataValidation(type="list", formula1=f"=lst_{f['list']}", allow_blank=True, showErrorMessage=True, showInputMessage=bool(msg))
             dv.errorTitle = "Not in list"
             dv.error = f"Choose a value from the list (edit the Lists sheet to add one)."
         elif t in ("number", "pct", "int"):
             lo, hi = f.get("min", 0), f.get("max", 1e12)
-            dv = DataValidation(type="whole" if t == "int" else "decimal", operator="between", formula1=str(lo), formula2=str(hi),
+            dv = DataValidation(type="whole" if t == "int" else "decimal", operator="between", formula1=num_text(lo), formula2=num_text(hi),
                                 allow_blank=True, showErrorMessage=True, errorStyle="warning", showInputMessage=bool(msg))
             dv.errorTitle = "Outside expected range"
-            dv.error = f"Expected between {lo} and {hi}. Click Yes to keep the value if it is correct."
+            dv.error = f"Expected between {lo:,.15g} and {hi:,.15g}. Click Yes to keep the value if it is correct."
         elif t == "date":
-            dv = DataValidation(type="date", operator="between", formula1="=cfg_YearStart-31", formula2="=cfg_YearEnd", allow_blank=True,
+            # rows dated outside the year have no Calc_Daily row and would vanish from every KPI
+            lo = "=EDATE(cfg_YearStart,-12)" if prefill == "prior_months" else "=cfg_YearStart"
+            dv = DataValidation(type="date", operator="between", formula1=lo, formula2="=cfg_YearEnd", allow_blank=True,
                                 showErrorMessage=True, errorStyle="warning", showInputMessage=bool(msg))
-            dv.errorTitle = "Date outside the reporting year"
-            dv.error = "Dates should fall in the reporting year (December of the prior year is tolerated)."
+            if prefill == "prior_months":
+                dv.errorTitle = "Month outside the prior or reporting year"
+                dv.error = "Months must fall in the prior year or the reporting year (the rolling 12-month window). Click No and correct the month."
+            else:
+                dv.errorTitle = "Date outside the reporting year"
+                dv.error = "Dates must fall in the reporting year: rows outside it are not counted in any KPI. Click No and correct the date."
         else:
             return None
         if msg:
@@ -1888,7 +2041,66 @@ class Builder:
         wb.properties.title = f"{site['name']} Production System {self.year}"
         wb.properties.creator = "Mako Production System"
         wb.properties.subject = "Daily production reporting"
+        self.check_catalogue()
         return wb
+
+    # ---- consistency of the KPI catalogue and report formulas with the schema ----------
+    def check_catalogue(self):
+        """Every tblX[Col] reference, quoted list criterion and budget column in the KPI catalogue and in the generated
+        formulas must exist in the schema; otherwise Excel shows #REF! or a renamed list value silently sums to zero."""
+        s = self.s
+        tables = {t["table"]: {f["name"]: f for f in t["fields"]} for t in s["tables"]}
+        lists = dict(s["lists"])
+        lists.update(s.get("derived_lists", {}))
+        for rdef in s["reference_tables"].values():
+            tables[rdef["table"]] = {c["name"]: c for c in rdef["columns"]}
+            lists[rdef["key"]] = [row[0] for row in rdef["rows"]]
+        for lname in lists:
+            tables[f"tblList_{lname}"] = {lname: {"name": lname, "type": "text"}}
+        ref_re = re.compile(r"(tbl\w+)\[(?:\[#This Row\],)?\[?(\w+)\]?\]?")
+        crit_re = re.compile(r"(tbl\w+)\[(\w+)\],\"([^\"<>=?]+)\"")  # skips operators and the ? sentinel
+        problems = []
+
+        def check(text: str, where: str):
+            for tbl, col in ref_re.findall(text):
+                if tbl not in tables:
+                    problems.append(f"{where}: table {tbl} is not in the schema")
+                elif col not in tables[tbl]:
+                    problems.append(f"{where}: column {tbl}[{col}] is not in the schema")
+            for tbl, col, val in crit_re.findall(text):
+                f = tables.get(tbl, {}).get(col)
+                lname = (f or {}).get("list") or (f or {}).get("values_from")
+                if lname and val not in lists.get(lname, []):
+                    problems.append(f"{where}: value \"{val}\" is not in list {lname} ({tbl}[{col}])")
+
+        budget_cols = tables["tblBudget"]
+        for k in KPIS:
+            for part in ("day", "num", "den"):
+                if k.get(part):
+                    check(k[part], f"KPI {k['key']}")
+            if k.get("budget") and k["budget"] not in budget_cols:
+                problems.append(f"KPI {k['key']}: budget column tblBudget[{k['budget']}] is not in the schema")
+            for part in ("num", "den"):
+                for key in re.findall(r"\{(\w+)\}", k.get(part, "")):
+                    if key not in KPI:
+                        problems.append(f"KPI {k['key']}: {part} refers to unknown KPI {key}")
+        for ws in (self.wb["Daily_Report"], self.wb["Config"], self.wb["Monthly_Summary"], self.wb["Lists"]):
+            for row in ws.iter_rows():
+                for c in row:
+                    if isinstance(c.value, str) and c.value.startswith("="):
+                        check(c.value, f"{ws.title}!{c.coordinate}")
+        for ws_name in ("Calc_Daily", "Chart_Data"):
+            for c in self.wb[ws_name][2]:
+                if isinstance(c.value, str) and c.value.startswith("="):
+                    check(c.value, f"{ws_name}!{c.coordinate}")
+        for tbl, info in self.tables.items():
+            ws = self.wb[info["sheet"]]
+            for L in info["cols"].values():
+                v = ws[f"{L}{info['first']}"].value
+                if isinstance(v, str) and v.startswith("="):
+                    check(v, f"{tbl} calc column {L}")
+        if problems:
+            raise ValueError("schema / catalogue mismatch:\n  " + "\n  ".join(problems[:20]))
 
     # Lists ------------------------------------------------------------------------
     def sheet_lists(self, ws):
@@ -1920,36 +2132,49 @@ class Builder:
     def sheet_config(self, ws, sample):
         site = self.s["site"]
         self.title(ws, "Config", "Site settings and opening balances. Names in column C are used by the formulas.")
+        consts = self.s["constants"]
         settings = [
             ("Site", site["name"], "cfg_Site", "text"),
             ("Company", site["company"], "cfg_Company", "text"),
-            ("Reporting year", self.year, "cfg_Year", "int"),
+            ("Report title", f"{site['name']} daily production report", "cfg_ReportTitle", "text"),
+            ("Date of last LTI before this year", sample.get("prior_lti") if sample else None, "cfg_PriorLTIDate", "date"),
+        ] + [(label, consts[key], nm, "number" if isinstance(consts[key], float) else "count") for key, (nm, label) in CONSTANTS.items()] + [
+            # calculated: the reporting year is fixed when the workbook is generated (dates in Calc_Daily and the prefilled tables)
+            ("Calculated (do not type here)", None, "", "head"),
+            ("Reporting year (from the generator; run build_workbook.py --year to change)", "=YEAR(INDEX(cd_Date,1))", "cfg_Year", "int"),
             ("Year start", "=DATE(cfg_Year,1,1)", "cfg_YearStart", "date"),
             ("Year end", "=DATE(cfg_Year,12,31)", "cfg_YearEnd", "date"),
-            ("Troy ounce (g)", self.s["constants"]["TROY_OZ_G"], "cfg_TroyOz", "number"),
-            ("Date of last LTI before this year", sample.get("prior_lti") if sample else None, "cfg_PriorLTIDate", "date"),
-            ("Last date with plant data (calculated)", '=SUMPRODUCT(MAX((tblPlant[Milled_t]<>"")*tblPlant[Date]))', "cfg_LastDataDate", "date"),
-            ("Report title", f"{site['name']} daily production report", "cfg_ReportTitle", "text"),
+            ("Last date with plant data", '=SUMPRODUCT(MAX((tblPlant[Milled_t]<>"")*tblPlant[Date]))', "cfg_LastDataDate", "date"),
+            ("Plant feed stockpile check", '=IF(COUNTIF(tblStockpiles[Plant_Feed],"Y")=1,"OK","Exactly one stockpile must have Plant_Feed = Y")', "cfg_FeedCheck", "text"),
+            ("Year check", '=IF(cfg_Year<>YEAR(INDEX(cd_Date,1)),"Year mismatch: rebuild the workbook with build_workbook.py --year","")', "cfg_YearCheck", "text"),
         ]
         r = 4
         ws.cell(r, 1, "Setting").font = font(bold=True); ws.cell(r, 2, "Value").font = font(bold=True); ws.cell(r, 3, "Name").font = font(bold=True)
         for lab, val, nm, typ in settings:
             r += 1
+            if typ == "head":
+                r += 1
+                ws.cell(r, 1, lab).font = font(bold=True, color="595959")
+                continue
             ws.cell(r, 1, lab)
             c = ws.cell(r, 2, val)
-            c.number_format = FMT["date"] if typ == "date" else ("0" if typ == "int" else ("0.0000" if typ == "number" else "@"))
+            c.number_format = {"date": FMT["date"], "int": "0", "count": "#,##0", "number": "0.0000"}.get(typ, "@")
             c.font = font(color="1F3864" if not (isinstance(val, str) and val.startswith("=")) else "595959")
             c.border = BORDER
             ws.cell(r, 3, nm).font = font(color="7F7F7F", size=9)
             self.name(nm, f"Config!$B${r}")
-        self.set_widths(ws, {"A": 36, "B": 30, "C": 18})
-        # reference tables on Config (stockpiles) and prior-year safety history
+            if nm in ("cfg_FeedCheck", "cfg_YearCheck"):
+                ok = '"OK"' if nm == "cfg_FeedCheck" else '""'
+                ws.conditional_formatting.add(f"B{r}", FormulaRule(formula=[f"B{r}<>{ok}"], fill=fill(C_WARN), font=Font(color="9C0006", bold=True)))
+        self.set_widths(ws, {"A": 60, "B": 30, "C": 18})
+        # reference tables on Config (stockpiles, with spare rows for stockpiles opened during the year) and safety history
         col = 5
         for rname, rdef in self.s["reference_tables"].items():
             if rdef["sheet"] != "Config":
                 continue
             rows = sample.get(rdef["table"], rdef["rows"]) if sample else rdef["rows"]
-            tdef = {"table": rdef["table"], "title": "Stockpile opening balances (survey at start of year)", "fields": rdef["columns"], "rows": len(rows)}
+            tdef = {"table": rdef["table"], "title": "Stockpile opening balances: surveyed tonnes at the start of Survey_Date (1 January if blank); spare rows for stockpiles opened later",
+                    "fields": rdef["columns"], "rows": len(rows) + int(rdef.get("spare_rows", 0))}
             ws.cell(3, col, tdef["title"]).font = font(bold=True, color=C_HEAD)
             info = self.write_table(ws, tdef, anchor_col=col, anchor_row=4, data=rows, style="TableStyleLight9")
             col += len(rdef["columns"]) + 1
@@ -1962,7 +2187,8 @@ class Builder:
     # Input sheets -----------------------------------------------------------------
     def sheet_input(self, ws, tdef, data):
         if ws["A1"].value is None:
-            self.title(ws, tdef["title"], f"Owner: {tdef.get('owner', '')}. Yellow-free rule: type values only in the blue-headed columns; grey-headed columns are formulas.")
+            self.title(ws, tdef["title"], f"Owner: {tdef.get('owner', '')}. Type only in the blue-headed columns; grey-headed columns are formulas. "
+                                          "Add rows at the bottom only; never insert columns. Paste with Paste Special > Values only. Red cells need attention (missing or unknown value, duplicate date).")
             anchor_row = 4
         else:
             anchor_row = ws.max_row + 3
@@ -1989,13 +2215,11 @@ class Builder:
         if k.get("budget"):
             return True
         if k["kind"] == "ratio":
-            import re
-            refs = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", k["num"] + k["den"]))
-            return all(self.has_budget(KPI[x]) for x in refs if x in KPI)
+            refs = {x for x in re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", k["num"] + k["den"]) if x in KPI}
+            return bool(refs) and all(self.has_budget(KPI[x]) for x in refs)
         return False
 
     def resolve(self, expr: str, r: int, period: str = "", budget: bool = False) -> str:
-        import re
         c = self.cd_cols
 
         def rep(m):
@@ -2008,8 +2232,8 @@ class Builder:
                 return f"$D{r}"
             if key == "r":
                 return str(r)
-            if key == "TROY":
-                return TROY
+            if key in PLACEHOLDERS:
+                return PLACEHOLDERS[key]
             if key in KPI:
                 if budget:
                     hdr = f"Bud_{key}_{period}"
@@ -2045,7 +2269,7 @@ class Builder:
                 nf = FMT.get(k["unit"], FMT["number"])
                 if kind == "sum":
                     day = "=" + self.resolve(k["day"], r)
-                    mtd = f"={key}_ROW" if False else (f"=${c[key]}{r}" if r == first else f"=IF($B{r}=$B{r-1},${c[key + '_MTD']}{r-1},0)+${c[key]}{r}")
+                    mtd = f"=${c[key]}{r}" if r == first else f"=IF($B{r}=$B{r-1},${c[key + '_MTD']}{r-1},0)+${c[key]}{r}"
                     ytd = f"=${c[key]}{r}" if r == first else f"=${c[key + '_YTD']}{r-1}+${c[key]}{r}"
                     for hdr, f_ in ((key, day), (key + "_MTD", mtd), (key + "_YTD", ytd)):
                         cell = ws[f"{c[hdr]}{r}"]; cell.value = f_; cell.number_format = nf
@@ -2116,7 +2340,8 @@ class Builder:
                     val = f"Calc_Daily!${c['Bud_Milled_t_Month']}{r}/Calc_Daily!$D{r}"
                 else:
                     val = f"Calc_Daily!${c[src]}{r}"
-                f_ = f"=IF($A{r}>cfg_LastDataDate,NA(),{val})" if guard else f"={val}"
+                # beyond the last data date, or where the KPI is blank text (no assay yet), plot a gap rather than zero
+                f_ = f"=IF(OR($A{r}>cfg_LastDataDate,NOT(ISNUMBER({val}))),NA(),{val})" if guard else f"={val}"
                 ws.cell(r, j, f_)
         self.formula_count += (last - first + 1) * len(series)
         ws.protection.sheet = True
@@ -2126,25 +2351,48 @@ class Builder:
     def sheet_daily_report(self, ws):
         c = self.cd_cols
         ws.sheet_view.showGridLines = False
-        self.set_widths(ws, {"A": 2, "B": 34, "C": 8, "D": 13, "E": 13, "F": 13, "G": 9, "H": 13, "I": 13, "J": 9, "K": 2, "L": 10})
+        self.set_widths(ws, {"A": 2, "B": 34, "C": 14, "D": 13, "E": 13, "F": 13, "G": 9, "H": 13, "I": 13, "J": 9, "K": 2, "L": 10})
         ws["B2"] = "=cfg_ReportTitle"; ws["B2"].font = font(bold=True, size=16, color=C_HEAD)
         ws["B3"] = "=cfg_Company&\" | \"&cfg_Site"; ws["B3"].font = font(italic=True, color="595959")
         ws["B5"] = "Report date"; ws["B5"].font = font(bold=True)
-        ws["C5"] = self.report_date if self.report_date else "=MAX(cfg_YearStart,MIN(TODAY()-1,cfg_YearEnd,IF(N(cfg_LastDataDate)>0,cfg_LastDataDate,cfg_YearEnd)))"
+        ws["C5"] = self.report_date if self.report_date else DEFAULT_DATE_FORMULA
         ws["C5"].number_format = "ddd dd-mmm-yyyy"; ws["C5"].font = font(bold=True, color=C_HEAD); ws["C5"].fill = fill(C_KEY); ws["C5"].border = BORDER
         ws["C5"].protection = Protection(locked=False)
         ws.merge_cells("C5:E5")
-        ws["F5"] = "Type a date to change the report day. To restore the default enter =MIN(TODAY()-1,cfg_LastDataDate)"; ws["F5"].font = font(italic=True, size=9, color="7F7F7F")
+        # the instruction lives in the input message (not printed); a date outside the year is stopped, and F5 warns if one slips through
+        dv = DataValidation(type="date", operator="between", formula1="=cfg_YearStart", formula2="=cfg_YearEnd", allow_blank=False,
+                            showErrorMessage=True, errorStyle="stop", showInputMessage=True)
+        dv.errorTitle = "Date outside the reporting year"
+        dv.error = "The report date must fall in the reporting year (1 January to 31 December)."
+        dv.promptTitle = "Report date"
+        dv.prompt = ("Type a date in the reporting year to change the report day. To restore the default (yesterday, or the last day "
+                     f"with plant data) enter {DEFAULT_DATE_FORMULA}")[:255]
+        ws.add_data_validation(dv); dv.add("C5")
+        ws["F5"] = '=IF(ISNUMBER(rpt_Row),cfg_YearCheck,"Report date is outside the reporting year: enter a date between 1 January and 31 December "&cfg_Year)'
+        ws["F5"].font = font(bold=True, size=9, color="C00000")
         ws["L5"] = "=IFERROR(MATCH($C$5,cd_Date,0),NA())"; ws["L5"].font = font(color="BFBFBF", size=8)
         ws["L4"] = "row"; ws["L4"].font = font(color="BFBFBF", size=8)
         self.name("rpt_Date", "Daily_Report!$C$5")
         self.name("rpt_Row", "Daily_Report!$L$5")
-        ws["B6"] = '="Data to "&IF(N(cfg_LastDataDate)>0,TEXT(cfg_LastDataDate,"dd mmm yyyy"),"(no plant data yet)")&"  |  Week "&_xlfn.ISOWEEKNUM($C$5)&"  |  Day "&DAY($C$5)&" of "&DAY(EOMONTH($C$5,0))'
+        ws["B6"] = ('=IF(ISNUMBER(rpt_Row),"Data to "&IF(N(cfg_LastDataDate)>0,' + xl_date_text("cfg_LastDataDate") + ',"(no plant data yet)")'
+                    '&"  |  Week "&_xlfn.ISOWEEKNUM($C$5)&"  |  Day "&DAY($C$5)&" of "&DAY(EOMONTH($C$5,0)),"Report date is outside the reporting year")')
         ws["B6"].font = font(size=9, color="595959")
+        # completeness and integrity line: rows entered for the report date per table, and movement rows no KPI can count
+        ws["B7"] = ('="Rows for this date: Plant "&COUNTIFS(tblPlant[Date],rpt_Date,tblPlant[Milled_t],"<>")'
+                    '&", Movements "&COUNTIFS(tblMovement[Date],rpt_Date)&", Fleet "&COUNTIFS(tblFleet[Date],rpt_Date)'
+                    '&", Mining daily "&COUNTIFS(tblMiningDaily[Date],rpt_Date,tblMiningDaily[Diesel_L],"<>")'
+                    '&", Safety "&COUNTIFS(tblSafety[Date],rpt_Date,tblSafety[Hours_Employees],"<>")&", Comments "&COUNTIFS(tblCommentary[Date],rpt_Date)'
+                    '&"  |  Movement rows with unknown source or destination: "&(COUNTIF(tblMovement[Source_Type],"?")+COUNTIF(tblMovement[Dest_Type],"?"))'
+                    '&"  |  Movement rows dated outside the year: "&(COUNTIFS(tblMovement[Date],"<"&cfg_YearStart)+COUNTIFS(tblMovement[Date],">"&cfg_YearEnd))')
+        ws["B7"].font = font(size=9, color="595959")
+        self.name("rpt_Checks", "Daily_Report!$B$7")
 
         headers = ["", "Unit", "Day", "MTD", "MTD budget", "Var %", "YTD", "YTD budget", "Var %"]
         r = 8
+        break_row = None
         for section, items in REPORT_LAYOUT:
+            if section == PAGE_BREAK_BEFORE:
+                break_row = r - 1
             for j, h in enumerate(headers):
                 cell = ws.cell(r, 2 + j, section if j == 0 else h)
                 cell.font = font(bold=True, color="FFFFFF"); cell.fill = fill(C_HEAD)
@@ -2154,7 +2402,9 @@ class Builder:
                 k = KPI[key]
                 nf = FMT.get(k["unit"], FMT["number"])
                 ws.cell(r, 2, k["label"]).font = font()
-                ws.cell(r, 3, "" if k["unit"] in ("int", "ratio", "rate", "days") else k["unit"]).font = font(color="7F7F7F", size=9)
+                # rates print their hours basis (per 1,000,000 h) so the reader knows the convention
+                unit = '="per "&TEXT(cfg_RateBasisHours,"#,##0")&" h"' if k["unit"] == "rate" else ("" if k["unit"] in ("int", "ratio", "days") else k["unit"])
+                ws.cell(r, 3, unit).font = font(color="7F7F7F", size=9)
                 has_periods = k["kind"] in ("sum", "ratio")
                 def idx(hdr):
                     return f'=IFERROR(INDEX(cd_{hdr},rpt_Row),"")'
@@ -2173,29 +2423,36 @@ class Builder:
                         ws.cell(r, j).alignment = Alignment(horizontal="right")
                 r += 1
             r += 1
-        # stockpiles
+        # stockpiles: one report row per tblStockpiles row including the spare rows, blank until a stockpile is named
         sp = self.tables["tblStockpiles"]
         n_sp = sp["last"] - sp["first"] + 1
+        ws.cell(r - 1, 2, '=IF(cfg_FeedCheck="OK","",cfg_FeedCheck&" (Config): the plant feed deduction below is wrong until this is fixed")').font = font(bold=True, size=9, color="C00000")
         hdr = ["STOCKPILES (to report date)", "", "Opening t", "Opening g/t", "In t", "Out t", "Plant feed t", "Balance t", "Balance g/t"]
         for j, h in enumerate(hdr):
             cell = ws.cell(r, 2 + j, h); cell.font = font(bold=True, color="FFFFFF"); cell.fill = fill(C_HEAD)
             cell.alignment = Alignment(horizontal="left" if j == 0 else "center")
         r += 1
+        # balance window: from the later of 1 January and the stockpile's Survey_Date (the opening balance is the surveyed
+        # tonnage at the start of that day) to the report date; rows before it are not part of the balance
         for i in range(1, n_sp + 1):
             nm = f"INDEX(tblStockpiles[Stockpile],{i})"
-            ws.cell(r, 2, f"={nm}")
-            ws.cell(r, 4, f"=INDEX(tblStockpiles[Opening_t],{i})").number_format = FMT["t"]
-            ws.cell(r, 5, f"=INDEX(tblStockpiles[Opening_gpt],{i})").number_format = FMT["g/t"]
-            ws.cell(r, 6, f'=SUMIFS(tblMovement[Tonnes_t],tblMovement[Destination],{nm},tblMovement[Date],"<="&rpt_Date)').number_format = FMT["t"]
-            ws.cell(r, 7, f'=SUMIFS(tblMovement[Tonnes_t],tblMovement[Source],{nm},tblMovement[Date],"<="&rpt_Date)').number_format = FMT["t"]
-            ws.cell(r, 8, f'=IF(INDEX(tblStockpiles[Plant_Feed],{i})="Y",SUMIFS(tblPlant[Milled_t],tblPlant[Date],"<="&rpt_Date)-SUMIFS(tblMovement[Tonnes_t],tblMovement[Dest_Type],"Plant",tblMovement[Date],"<="&rpt_Date),0)').number_format = FMT["t"]
-            ws.cell(r, 9, f"=D{r}+F{r}-G{r}-H{r}").number_format = FMT["t"]
+            since = f'">="&MAX(cfg_YearStart,N(INDEX(tblStockpiles[Survey_Date],{i})))'
+            in_win = f'tblMovement[Date],{since},tblMovement[Date],"<="&rpt_Date'
+            pl_win = f'tblPlant[Date],{since},tblPlant[Date],"<="&rpt_Date'
+            g = f'=IF(OR(NOT(ISNUMBER(rpt_Row)),{nm}=""),"",'   # blank when no stockpile is named or the report date is outside the year
+            ws.cell(r, 2, f"{g}{nm})")
+            ws.cell(r, 4, f"{g}INDEX(tblStockpiles[Opening_t],{i}))").number_format = FMT["t"]
+            ws.cell(r, 5, f"{g}INDEX(tblStockpiles[Opening_gpt],{i}))").number_format = FMT["g/t"]
+            ws.cell(r, 6, f'{g}SUMIFS(tblMovement[Tonnes_t],tblMovement[Destination],{nm},{in_win}))').number_format = FMT["t"]
+            ws.cell(r, 7, f'{g}SUMIFS(tblMovement[Tonnes_t],tblMovement[Source],{nm},{in_win}))').number_format = FMT["t"]
+            ws.cell(r, 8, f'{g}IF(INDEX(tblStockpiles[Plant_Feed],{i})="Y",SUMIFS(tblPlant[Milled_t],{pl_win})-SUMIFS(tblMovement[Tonnes_t],tblMovement[Dest_Type],"Plant",{in_win}),0))').number_format = FMT["t"]
+            ws.cell(r, 9, f'=IF($B{r}="","",D{r}+F{r}-G{r}-H{r})').number_format = FMT["t"]
             # ounces: opening + in - out - plant feed (feed oz less direct tip oz)
             oz = (f'(D{r}*E{r}/{TROY}'
-                  f'+SUMIFS(tblMovement[Contained_oz],tblMovement[Destination],{nm},tblMovement[Date],"<="&rpt_Date)'
-                  f'-SUMIFS(tblMovement[Contained_oz],tblMovement[Source],{nm},tblMovement[Date],"<="&rpt_Date)'
-                  f'-IF(INDEX(tblStockpiles[Plant_Feed],{i})="Y",SUMIFS(tblPlant[Feed_oz],tblPlant[Date],"<="&rpt_Date)-SUMIFS(tblMovement[Contained_oz],tblMovement[Dest_Type],"Plant",tblMovement[Date],"<="&rpt_Date),0))')
-            ws.cell(r, 10, f'=IFERROR(IF(I{r}>0,{oz}*{TROY}/I{r},""),"")').number_format = FMT["g/t"]
+                  f'+SUMIFS(tblMovement[Contained_oz],tblMovement[Destination],{nm},{in_win})'
+                  f'-SUMIFS(tblMovement[Contained_oz],tblMovement[Source],{nm},{in_win})'
+                  f'-IF(INDEX(tblStockpiles[Plant_Feed],{i})="Y",SUMIFS(tblPlant[Feed_oz],{pl_win})-SUMIFS(tblMovement[Contained_oz],tblMovement[Dest_Type],"Plant",{in_win}),0))')
+            ws.cell(r, 10, f'=IFERROR(IF(AND($B{r}<>"",I{r}>0),{oz}*{TROY}/I{r},""),"")').number_format = FMT["g/t"]
             for j in range(2, 11):
                 ws.cell(r, j).border = BORDER
             r += 1
@@ -2211,20 +2468,25 @@ class Builder:
             ws.cell(r, 3, f'=IFERROR(INDEX(tblCommentary[Comment],MATCH(rpt_Date&"|"&{n},tblCommentary[Key_Day],0)),"")').font = font(size=9)
             ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=10)
             ws.cell(r, 3).alignment = Alignment(wrap_text=True, vertical="top")
-            ws.row_dimensions[r].height = 24
+            ws.row_dimensions[r].height = COMMENT_ROW_PT
             r += 1
         r += 1
-        ws.cell(r, 2, '="Generated by the Mako Production System workbook. Printed "&TEXT(NOW(),"dd mmm yyyy hh:mm")').font = font(italic=True, size=8, color="7F7F7F")
+        ws.cell(r, 2, '="Generated by the Mako Production System workbook. Printed "&' + xl_date_text("NOW()")
+                + '&" "&TEXT(HOUR(NOW()),"00")&":"&TEXT(MINUTE(NOW()),"00")').font = font(italic=True, size=8, color="7F7F7F")
         # print setup
+        # two portrait A4 pages: safety and mining, then processing, gold, stockpiles and commentary
         ws.print_area = f"B2:J{r}"
-        ws.page_setup.orientation = "landscape"
+        ws.page_setup.orientation = "portrait"
         ws.page_setup.paperSize = ws.PAPERSIZE_A4
         ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
+        ws.page_setup.fitToHeight = 2
         ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        if break_row:
+            ws.row_breaks.append(Break(id=break_row))
         ws.print_options.horizontalCentered = True
         ws.page_margins.left = ws.page_margins.right = 0.4
         ws.protection.sheet = True
+        ws.protection.formatRows = False   # users may enlarge a commentary row for a long comment
         self.report_last_row = r
 
     # Monthly_Summary --------------------------------------------------------------
@@ -2232,7 +2494,8 @@ class Builder:
         ws.sheet_view.showGridLines = False
         self.set_widths(ws, {"A": 2, "B": 34, "C": 10, **{get_column_letter(i): 11 for i in range(4, 17)}})
         ws["B2"] = '=cfg_Site&" monthly summary "&cfg_Year'; ws["B2"].font = font(bold=True, size=16, color=C_HEAD)
-        ws["B3"] = '="Actuals to "&IF(N(cfg_LastDataDate)>0,TEXT(cfg_LastDataDate,"dd mmm yyyy"),"(no plant data yet)")&". Budget from the Budget sheet. Ratios are month values, not averages of days."'
+        ws["B3"] = ('="Actuals to "&IF(N(cfg_LastDataDate)>0,' + xl_date_text("cfg_LastDataDate") + ',"(no plant data yet)")'
+                    '&". Budget from the Budget sheet, pro-rata to that date for the current month and the Year column; full month otherwise. Ratios are month values, not averages of days."')
         ws["B3"].font = font(italic=True, size=9, color="595959")
         r = 5
         ws.cell(r, 2, "KPI").font = font(bold=True, color="FFFFFF"); ws.cell(r, 2).fill = fill(C_HEAD)
@@ -2259,7 +2522,9 @@ class Builder:
                         src = f"cd_{key}_MTD" if k["kind"] in ("sum", "ratio") else f"cd_{key}"
                         f_ = f'=IF({ms}>cfg_LastDataDate,"",IFERROR(INDEX({src},MATCH({me},cd_Date,0)),""))'
                     elif kind == "budget":
-                        f_ = f'=IFERROR(INDEX(cd_Bud_{key}_Month,MATCH({ms},cd_Date,0)),"")'
+                        # the month in progress compares MTD actual with the pro-rata budget to the same date
+                        f_ = (f'=IF({ms}>cfg_LastDataDate,IFERROR(INDEX(cd_Bud_{key}_Month,MATCH({ms},cd_Date,0)),""),'
+                              f'IFERROR(INDEX(cd_Bud_{key}_MTD,MATCH({me},cd_Date,0)),""))')
                     else:
                         f_ = f'=IF(AND(ISNUMBER({get_column_letter(col)}{first_r}),ISNUMBER({get_column_letter(col)}{first_r+1}),{get_column_letter(col)}{first_r+1}<>0),{get_column_letter(col)}{first_r}/{get_column_letter(col)}{first_r+1}-1,"")'
                     cell = ws.cell(r, col, f_)
@@ -2272,14 +2537,15 @@ class Builder:
                     src = f"cd_{key}_YTD" if k["kind"] in ("sum", "ratio") else f"cd_{key}"
                     f_ = f'=IFERROR(INDEX({src},MATCH(MIN(cfg_YearEnd,cfg_LastDataDate),cd_Date,0)),"")'
                 elif kind == "budget":
-                    f_ = '=IFERROR(INDEX(cd_Bud_%s_YTD,MATCH(cfg_YearEnd,cd_Date,0)),"")' % key
+                    # year to date budget at the last data date (full year while there is no data yet)
+                    f_ = f'=IFERROR(INDEX(cd_Bud_{key}_YTD,MATCH(IF(N(cfg_LastDataDate)>0,MIN(cfg_YearEnd,cfg_LastDataDate),cfg_YearEnd),cd_Date,0)),"")'
                 else:
                     f_ = f'=IF(AND(ISNUMBER(P{first_r}),ISNUMBER(P{first_r+1}),P{first_r+1}<>0),P{first_r}/P{first_r+1}-1,"")'
                 cell = ws.cell(r, 16, f_); cell.number_format = "+0.0%;-0.0%;0.0%" if kind == "var" else nf; cell.border = BORDER; cell.font = font(bold=True)
                 r += 1
             r += 1 if has_b else 0
         ws.freeze_panes = "D6"
-        ws.page_setup.orientation = "landscape"; ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+        ws.page_setup.orientation = "landscape"; ws.page_setup.paperSize = ws.PAPERSIZE_A4; ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
         ws.protection.sheet = True
 
@@ -2287,7 +2553,7 @@ class Builder:
     def sheet_dashboard(self, ws, ws_chart):
         ws.sheet_view.showGridLines = False
         ws["B2"] = '=cfg_Site&" dashboard "&cfg_Year'; ws["B2"].font = font(bold=True, size=16, color=C_HEAD)
-        ws["B3"] = '="Data to "&IF(N(cfg_LastDataDate)>0,TEXT(cfg_LastDataDate,"dd mmm yyyy"),"(no plant data yet)")'; ws["B3"].font = font(italic=True, size=9, color="595959")
+        ws["B3"] = '="Data to "&IF(N(cfg_LastDataDate)>0,' + xl_date_text("cfg_LastDataDate") + ',"(no plant data yet)")'; ws["B3"].font = font(italic=True, size=9, color="595959")
         first, last = self.cd_rows
         hdr = {s[0]: i + 1 for i, s in enumerate(self.chart_series)}
 
@@ -2301,20 +2567,28 @@ class Builder:
             ch.y_axis.title = y_title; ch.legend.position = "b"
             ch.x_axis.number_format = "mmm"; ch.x_axis.majorTimeUnit = "months"
             ch.y_axis.majorGridlines = None
+            # openpyxl omits <c:delete/>; Excel then treats the axes as deleted and draws no labels or titles
+            ch.x_axis.delete = False; ch.y_axis.delete = False
+            ch.y_axis.crossAx = ch.x_axis.axId
+
+        # charts are 24 cm wide: right-hand charts are anchored 15 default columns (25.4 cm) to the right of the left ones
         # 1 gold poured YTD vs budget
         ch1 = LineChart(); ch1.add_data(ref("Gold_Poured_YTD"), titles_from_data=True); ch1.add_data(ref("Budget_Gold_Poured_YTD"), titles_from_data=True)
         ch1.set_categories(dates); ch1.x_axis = DateAxis(crossAx=100); style(ch1, "Gold poured, year to date (oz)", "oz")
         ch1.series[1].graphicalProperties.line.dashStyle = "dash"
         ws.add_chart(ch1, "B5")
         # 2 milled daily vs budget daily
+        # bar charts get a date axis too: a text axis over 365 daily categories repeats month labels
         ch2 = BarChart(); ch2.type = "col"; ch2.add_data(ref("Milled_t"), titles_from_data=True); ch2.set_categories(dates)
+        ch2.x_axis = DateAxis(crossAx=100)
         ln = LineChart(); ln.add_data(ref("Budget_Milled_daily"), titles_from_data=True); ln.set_categories(dates)
+        ln.x_axis = DateAxis(crossAx=100)   # same axId as the bar chart's axis, so one date axis is written
         ch2 += ln; style(ch2, "Milled tonnes per day vs budget", "t"); ch2.gapWidth = 30
-        ws.add_chart(ch2, "N5")
+        ws.add_chart(ch2, "Q5")
         # 3 ore and waste
         ch3 = BarChart(); ch3.type = "col"; ch3.grouping = "stacked"; ch3.overlap = 100
         ch3.add_data(ref("Ore_Mined_t"), titles_from_data=True); ch3.add_data(ref("Waste_t"), titles_from_data=True); ch3.set_categories(dates)
-        style(ch3, "Ore and waste mined per day (t)", "t"); ch3.gapWidth = 30
+        ch3.x_axis = DateAxis(crossAx=100); style(ch3, "Ore and waste mined per day (t)", "t"); ch3.gapWidth = 30
         ws.add_chart(ch3, "B24")
         # 4 recovery MTD and head grade MTD
         ch4 = LineChart(); ch4.add_data(ref("Recovery_MTD"), titles_from_data=True); ch4.add_data(ref("Budget_Recovery_MTD"), titles_from_data=True); ch4.set_categories(dates)
@@ -2322,12 +2596,18 @@ class Builder:
         ch4.series[1].graphicalProperties.line.dashStyle = "dash"
         ch5 = LineChart(); ch5.add_data(ref("Head_Grade_MTD"), titles_from_data=True); ch5.set_categories(dates)
         ch5.y_axis.axId = 200; ch5.y_axis.title = "g/t"; ch5.y_axis.crosses = "max"; ch5.y_axis.majorGridlines = None
+        ch5.y_axis.delete = False; ch5.x_axis.delete = True; ch5.x_axis.crossAx = 200   # secondary series share the date axis
         ch4 += ch5
-        ws.add_chart(ch4, "N24")
+        ws.add_chart(ch4, "Q24")
         # 5 TRIFR
         ch6 = LineChart(); ch6.add_data(ref("TRIFR_12m"), titles_from_data=True); ch6.set_categories(dates); ch6.x_axis = DateAxis(crossAx=100)
         style(ch6, "TRIFR, rolling 12 months", "per million hours")
         ws.add_chart(ch6, "B43")
+        # print: one landscape A4 page wide (charts end around column AF, row 60)
+        ws.print_area = "B2:AF60"
+        ws.page_setup.orientation = "landscape"; ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
         ws.protection.sheet = True
 
     # Data_Dictionary --------------------------------------------------------------
@@ -2341,9 +2621,9 @@ class Builder:
             for f in tdef["fields"]:
                 r += 1
                 val = f"list: {f['list']}" if f.get("list") else (f"{f.get('min', '')} to {f.get('max', '')}" if "min" in f or "max" in f else "")
-                ws.append([])  # keep row structure simple
                 for j, v in enumerate([tdef["table"], tdef["sheet"], f["name"], f.get("label", ""), "calculated" if f.get("calc") else f["type"],
-                                       f.get("unit", ""), "yes" if f.get("required") or f.get("key") else "", val, f.get("desc", ""), f.get("calc", "")], start=1):
+                                       f.get("unit", ""), "yes" if f.get("required") or f.get("key") else (f"when {f['required_when']}" if f.get("required_when") else ""),
+                                       val, f.get("desc", ""), f.get("calc", "")], start=1):
                     ws.cell(r, j, v).font = font(size=9)
         r += 2
         ws.cell(r, 1, "KPI catalogue (Calc_Daily)").font = font(bold=True, color=C_HEAD)
@@ -2362,6 +2642,7 @@ class Builder:
     # README -----------------------------------------------------------------------
     def sheet_readme(self, ws):
         site = self.s["site"]
+        tabs = ", ".join(dict.fromkeys(t["sheet"] for t in self.s["tables"] if t["sheet"] not in ("Config", "Lists")))
         ws.sheet_view.showGridLines = False
         ws.column_dimensions["A"].width = 3; ws.column_dimensions["B"].width = 120
         lines = [
@@ -2369,20 +2650,24 @@ class Builder:
             (f"{site['company']}. Version {self.s['version']}. Generated workbook: do not restructure by hand; change the schema and regenerate.", "sub"),
             ("", ""),
             ("How the workbook works", "h2"),
-            ("1. Inputs are the green tabs: Plant, Mining_Movements, Mining_Daily, Fleet, Safety, Gold, Commentary, Budget. Each is an Excel table. Type in the blue-headed columns only; grey-headed columns are formulas that fill automatically.", ""),
+            (f"1. Inputs are the green tabs: {tabs}. Each is an Excel table. Type in the blue-headed columns only; grey-headed columns are formulas that fill automatically.", ""),
             ("2. Calc_Daily rebuilds every KPI per day from the tables (day, month to date, year to date, budget). Daily_Report, Monthly_Summary and Dashboard read only from Calc_Daily.", ""),
             ("3. There are no links to other workbooks and no macros. Copying the file anywhere keeps it working.", ""),
             ("4. Lists holds every drop-down. Add a new pit, stockpile or equipment class there; do not type free text into list columns.", ""),
-            ("5. Config holds the year, the stockpile opening balances (survey at 1 January) and the prior-year safety history used for rolling 12-month rates.", ""),
+            ("5. Config holds the site constants (troy ounce, hours per day, injury rate basis), the stockpile opening balances (exactly one stockpile has Plant_Feed = Y) and the monthly safety history used for rolling 12-month rates. The reporting year is fixed when the workbook is generated; to roll to a new year run build_workbook.py --year, do not type over it.", ""),
+            ("6. If the report opens blank behind a yellow Protected View bar (a file received by e-mail or download), click Enable Editing; the workbook then calculates.", ""),
             ("", ""),
             ("Daily routine", "h2"),
-            ("Plant: enter the row for the day (dates are pre-filled). Mining: add one movement row per source, material and destination; add the Mining_Daily row and one Fleet row per equipment class. HSE: enter the Safety row. Everyone: one Commentary row per topic. Then open Daily_Report, check the date in C5, and print or export to PDF.", ""),
+            ("Plant: enter the row for the day (dates are pre-filled). Mining: add one movement row per source, material and destination; add the Mining_Daily row and one Fleet row per equipment class. HSE: enter the Safety row. Everyone: one Commentary row per topic. Then open Daily_Report, check the date in C5 and the 'Rows for this date' line in B7, and print or export to PDF.", ""),
+            ("One person edits the file at a time: open, enter, save, close. If Excel opens it Read-Only someone else has it: wait, do not Save As a copy. Suggested order: Mining 06:30, Plant 06:45, HSE 07:00, Commentary 07:15. Simultaneous entry needs the file on SharePoint or OneDrive.", ""),
             ("", ""),
             ("Rules", "h2"),
-            ("Do not insert columns inside tables, rename headers or move sheets. Add rows at the bottom of a table only. Blank means not reported; zero means reported as zero. Grades in g/t, tonnes dry metric, gold in troy ounces (31.1035 g).", ""),
-            ("Ore versus waste follows the Material list: anything starting with Ore counts as ore. Ex-pit movements (Source type Pit) count to TMM and strip ratio; movements from stockpiles are rehandle.", ""),
-            ("Recovery is calculated from head and tails grades (1 minus tails over head). Gold recovered is milled tonnes x (head minus tails) / 31.1035. Monthly metallurgical accounting adjustments are handled outside this workbook until the web system takes over.", ""),
-            ("TRIFR and LTIFR are per million hours over the last 12 calendar months plus the current month to date, using the Config history for months before this year.", ""),
+            ("Do not insert columns inside tables, rename headers or move sheets. Add rows at the bottom of a table only. Paste only with Paste Special > Values; an ordinary paste removes the drop-downs and range checks. Blank means not reported; zero means reported as zero. Grades in g/t, tonnes dry metric, gold in troy ounces (31.1035 g).", ""),
+            ("Ore versus waste follows the Material list: anything starting with Ore counts as ore. Ex-pit movements (Source type Pit) count to TMM and strip ratio; movements from stockpiles are rehandle. Every ore row needs a grade: ore tonnes without a grade are highlighted, excluded from the grade mined and shown as 'Ore mined without a grade' on the report. Enter either one daily total per source, material and destination or Day and Night rows, never both.", ""),
+            ("Recovery is calculated from head and tails grades (1 minus tails over head). Gold recovered is milled tonnes x (head minus tails) / 31.1035. A day whose head or tails grade is not yet entered shows blank recovery and is left out of the period grades, recovery and gold recovered until the assay arrives; throughput uses only days with run hours. Monthly metallurgical accounting adjustments are handled outside this workbook until the web system takes over.", ""),
+            ("Mill availability and utilisation count a day once any mill hours (run, planned or unplanned) are entered; a full-day shutdown is Planned maintenance 24 with Mill run hours 0.", ""),
+            ("Stockpile balances on the report run from the later of 1 January and the stockpile's Survey_Date (Opening_t is the surveyed tonnage at the start of that day) to the report date. After a re-survey enter the new tonnes, grade and Survey_Date on Config. The plant feed stockpile is debited with milled tonnes less direct tip, so its balance includes ore tipped to the crusher but not yet milled.", ""),
+            ("TRIFR and LTIFR are injuries per the rate basis on Config (1,000,000 hours) over the last 12 calendar months plus the current month to date. Months without daily Safety rows (the prior year, and this year before go-live) take their hours and injuries from the monthly history on Config.", ""),
             ("", ""),
             ("Support", "h2"),
             ("Schema and generator: mps_schema.json and build_workbook.py in the MPS tools folder. Report issues to the Director, Operations and Projects.", ""),
@@ -2450,7 +2735,7 @@ class Builder:
                           round(rng.uniform(3000, 3500)), None])
         sample["tblPlant"] = plant
         sample["tblMovement"] = moves
-        sample["tblMiningDaily"] = [[d, round(rng.uniform(1000, 1400)), round(rng.uniform(22000, 28000)), round(rng.uniform(5000, 7000)),
+        sample["tblMiningDaily"] = [[d, round(rng.uniform(1000, 1400)), round(rng.uniform(200, 400)), round(rng.uniform(22000, 28000)), round(rng.uniform(5000, 7000)),
                                      round(rng.uniform(30000, 40000)), round(rng.uniform(3000, 5000)), None] for d in days]
         fleet = []
         for d in days:
@@ -2530,10 +2815,11 @@ writes, with no arguments and byte-identical output on every run:
     docs/data_dictionary.md       field-level dictionary and the Excel to SQL mapping
 
 Everything about the data model comes from the schema and from the KPI catalogue
-in build_workbook.py (KPIS). The only knowledge typed into this file is listed
-under MODEL RULES below; each rule is honoured from the schema first when the
-schema carries the matching key (sql_table, sql_name, unique, sql_postgres,
-sql_sqlite), so it can move into the schema without touching the generator.
+in build_workbook.py (KPIS): table and column names (schema keys sql_table,
+sql_name), natural keys (unique), dialect-specific calc expressions (sql_postgres,
+sql_sqlite) and the constants ({TROY}, {HOURS_PER_DAY}, {RATE_BASIS_HOURS} in calc
+sql expressions). The only knowledge typed into this file is listed under MODEL
+RULES below.
 
 Mapping (documented again in the header of each SQL file and in the dictionary):
   * tables: Excel table name without the tbl prefix, CamelCase to snake_case;
@@ -2566,7 +2852,7 @@ OUT_DICTIONARY = ROOT / "docs" / "data_dictionary.md"
 
 sys.path.insert(0, str(HERE))
 try:
-    from build_workbook import KPIS  # the KPI catalogue is the single source of KPI definitions
+    from build_workbook import KPIS, CONSTANTS  # the KPI catalogue is the single source of KPI definitions
 except ImportError as exc:  # pragma: no cover - environment problem, not a schema problem
     sys.exit(f"build_ddl.py needs build_workbook.py (and openpyxl) next to it: {exc}")
 
@@ -2581,37 +2867,21 @@ SQL_TYPES = {
 NUMERIC_TYPES = ("number", "pct")
 
 # ----------------------------------------------------------------------------- MODEL RULES
-# Rules the schema does not carry yet. Schema keys win when present (see module docstring).
-
-# Natural key of the tables that hold several rows per day (schema key "unique").
-NATURAL_KEYS = {
-    "tblMovement": ["Date", "Shift", "Source", "Material", "Destination"],
-    "tblFleet": ["Date", "Equipment_Class"],
-}
+# Rules the schema does not carry yet.
 
 # Reference table keys that must also exist as keys of other reference tables
 # (schema desc of Stockpiles.Stockpile: "must match a Source and a Destination").
 REF_KEY_MATCHES = {"Stockpiles": ["Sources", "Destinations"]}
 
-# Dialect-specific replacements for calc "sql" expressions that are not portable
-# (schema keys "sql_postgres" / "sql_sqlite" win when present).
-# tblBudget.Days: the schema expression date_trunc('month', month) resolves to the
-# timestamptz overload in PostgreSQL, which is only STABLE, so it is refused inside
-# a generated column; the cast to timestamp makes it IMMUTABLE. SQLite has no EXTRACT.
-SQL_OVERRIDES = {
-    ("tblBudget", "Days"): {
-        "postgres": "EXTRACT(DAY FROM (date_trunc('month', month::timestamp) + INTERVAL '1 month - 1 day'))::integer",
-        "sqlite": "CAST(strftime('%d', date(month, 'start of month', '+1 month', '-1 day')) AS INTEGER)",
-    },
-}
-
 # KPI catalogue entries whose Excel Day formula is neither a plain SUMIFS over one table
 # nor arithmetic over other KPIs. "agg" runs inside the per-table aggregate (GROUP BY date);
-# {num:column} is the column cast to REAL in SQLite. "custom" names a handler in Model.custom_kpi
-# that runs in the final SELECT over the base row b (one row per date).
+# {num:column} is the column cast to REAL in SQLite; {HOURS_PER_DAY} and the other schema constants are
+# substituted. "custom" names a handler in Model.custom_kpi that runs in the final SELECT over the base
+# row b (one row per date).
 KPI_SQL = {
-    # COUNTIFS(tblPlant[Date],{d},tblPlant[Mill_Run_h],"<>")*24: 24 h for each day with a mill run entry
-    "Mill_Calendar_h": {"agg": ("tblPlant", "COUNT(mill_run_h) * 24")},
+    # IF(COUNTIFS(run)+COUNTIFS(planned)+COUNTIFS(unplanned)>0,{HOURS_PER_DAY},0): a full day of calendar
+    # hours for each day with any mill hours entered, else 0
+    "Mill_Calendar_h": {"agg": ("tblPlant", "CASE WHEN COUNT(COALESCE(mill_run_h, mill_planned_maint_h, mill_unplanned_down_h)) > 0 THEN {HOURS_PER_DAY} ELSE 0 END")},
     # point value: the day's GIC when reported, else NULL (Excel shows blank)
     "GIC_oz": {"agg": ("tblPlant", "NULLIF(SUM({num:gic_oz}), 0)"), "nullable": True},
     # rolling 12 calendar months plus month to date, per million hours; prior-year months come from
@@ -2673,6 +2943,12 @@ class Model:
         self.sqlite_generated = sqlite_generated
         self.troy = schema["constants"]["TROY_OZ_G"]
         self.rate_basis = schema["constants"].get("RATE_BASIS_HOURS", 1000000)
+        # {NAME} placeholders in sql expressions and KPI_SQL, and the Config names used by the KPI catalogue
+        self.consts = {"{TROY}": self.troy}
+        for k, value in schema["constants"].items():
+            self.consts["{" + k + "}"] = value
+            if k in CONSTANTS:
+                self.consts[CONSTANTS[k][0]] = value  # cfg_TroyOz and friends in the KPI catalogue
         self.lists = dict(schema["lists"])
         self.lists.update(schema.get("derived_lists", {}))
         self.ref_tables = schema["reference_tables"]
@@ -2714,7 +2990,19 @@ class Model:
         return None
 
     def natural_key(self, tdef: dict) -> list[str]:
-        return list(tdef.get("unique") or NATURAL_KEYS.get(tdef["table"], []))
+        """Schema key "unique": a list of column groups; one group per table is supported."""
+        groups = tdef.get("unique") or []
+        if groups and not isinstance(groups[0], list):
+            groups = [groups]
+        if len(groups) > 1:
+            raise NotImplementedError(f"{tdef['table']}: only one unique column group is supported")
+        return list(groups[0]) if groups else []
+
+    def const_sql(self, expr: str) -> str:
+        """Replace {TROY}, {HOURS_PER_DAY}, ... and their cfg_ names with the schema constants."""
+        for k, v in self.consts.items():
+            expr = expr.replace(k, repr(v))
+        return expr
 
     def list_target(self, f: dict) -> tuple[str, str]:
         lst = f["list"]
@@ -2734,10 +3022,10 @@ class Model:
 
     # ---- calculated fields -------------------------------------------------------
     def calc_expr(self, tdef: dict, f: dict, dialect: str) -> str | None:
-        expr = f.get(f"sql_{dialect}") or SQL_OVERRIDES.get((tdef["table"], f["name"]), {}).get(dialect) or f.get("sql")
+        expr = f.get(f"sql_{dialect}") or f.get("sql")
         if not expr:
             return None
-        return expr.replace("{TROY}", repr(self.troy))
+        return self.const_sql(expr)
 
     def same_row_inputs_only(self, tdef: dict, expr: str) -> bool:
         body = re.sub(r"'(?:[^']|'')*'", "''", expr)
@@ -2994,7 +3282,7 @@ class Model:
             if ov and "agg" in ov:
                 tbl, expr = ov["agg"]
                 expr = re.sub(r"\{num:(\w+)\}", lambda m: self.num(tbl, m.group(1), dialect), expr)
-                e.update(mode="agg", table=tbl, agg=expr, nullable=ov.get("nullable", False))
+                e.update(mode="agg", table=tbl, agg=self.const_sql(expr), nullable=ov.get("nullable", False))
             elif ov and "custom" in ov:
                 e.update(mode="custom", custom=ov["custom"], column=ov.get("column"), nullable=True)
             elif k["kind"] == "sum":
@@ -3003,6 +3291,9 @@ class Model:
                     tbl, col = m.group(1), m.group(2).lower()
                     crit = []
                     for c, v in CRIT_RE.findall(m.group(3)):
+                        if v == '"<>"':  # Excel: not blank
+                            crit.append(f"{c.lower()} IS NOT NULL")
+                            continue
                         lit = sql_str(v[1:-1]) if v.startswith('"') else v
                         crit.append(f"{c.lower()} = {lit}")
                     ref = self.num(tbl, col, dialect)
@@ -3014,7 +3305,7 @@ class Model:
                     skipped.append(key)
                     continue
             elif k["kind"] == "ratio":
-                e.update(mode="ratio", num=k["num"].replace("cfg_TroyOz", repr(self.troy)), den=k["den"].replace("cfg_TroyOz", repr(self.troy)))
+                e.update(mode="ratio", num=self.const_sql(k["num"]), den=self.const_sql(k["den"]))
                 e["nullable"] = True
             else:
                 skipped.append(key)
@@ -3286,7 +3577,7 @@ class Model:
         L.append("")
         L.append("- Table names drop the `tbl` prefix and become snake_case; tables with one row per day get the suffix `_daily`. Column names are the Excel field names in lower case.")
         L.append("- Primary key: the date or month column of the tables prefilled with one row per period; an `id` column (`BIGSERIAL` in PostgreSQL, `INTEGER PRIMARY KEY AUTOINCREMENT` in SQLite) elsewhere. "
-                 "Natural keys: " + "; ".join(f"`{self.tname(self.by_excel[t])}` ({', '.join(c.lower() for c in cols)})" for t, cols in NATURAL_KEYS.items()) +
+                 "Natural keys: " + "; ".join(f"`{self.tname(t)}` ({', '.join(c.lower() for c in self.natural_key(t))})" for t in self.s["tables"] if self.natural_key(t)) +
                  ". Where a natural-key column is optional (movement shift, blank for a daily total) the uniqueness is a unique index on `COALESCE(column, '')` so that two daily totals cannot be entered twice.")
         L.append("- `NOT NULL` for required and key fields. `CHECK` constraints from the schema min and max; Excel only warns, SQL rejects. Month columns must be the first day of the month.")
         L.append("- List fields reference `ref_<list>` tables seeded with the drop-down values in order (`sort_order`). `movement.source` and `movement.destination` reference the `sources` and `destinations` tables; `stockpiles.stockpile` must exist in both.")
@@ -3348,13 +3639,17 @@ class Model:
 
         def show(expr: str) -> str:
             return REF_RE.sub(lambda m: by_key[m.group(1)]["col"], expr)
+
+        def term(expr: str) -> str:  # parenthesise compound operands so the precedence reads as in the view
+            out = show(expr)
+            return f"({out})" if re.search(r"[-+*/]", out) else out
         for e in entries:
             if e["mode"] == "agg":
                 d = f"{e['agg']} over `{self.tname(self.by_excel[e['table']])}` per date"
             elif e["mode"] == "expr":
                 d = show(e["expr"])
             elif e["mode"] == "ratio":
-                d = f"{show(e['num'])} / {show(e['den'])}"
+                d = f"{term(e['num'])} / {term(e['den'])}"
             else:
                 d = {"rate12": f"({e.get('column')} over the last 12 calendar months plus month to date) * {self.rate_basis} / hours_total over the same window; prior months from safety_history where safety_daily has no rows",
                      "days_since_lti": "date minus the last date in safety_daily with lti > 0"}[e["custom"]]
@@ -3449,10 +3744,14 @@ $content_mps_validate_workbook_py = @'
 validate_workbook.py - build, recalculate and independently verify the MPS workbook.
 
 What it does
-  1. builds three workbooks with build_workbook.py:
+  1. builds four workbooks with build_workbook.py:
        demo    : 74 days of synthetic DEMO data, report date fixed to 10 Feb
        default : the same data, report date left to the workbook's default formula
        blank   : no data at all
+       edge    : the demo with partially entered rows (missing grades, missing run
+                 hours, a full-day shutdown, an ungraded ore row, an unknown source,
+                 a row dated in the prior year) plus a Probe sheet that measures every
+                 lst_ drop-down name
   2. recalculates them with LibreOffice (headless) and reads the values back
   3. recomputes the key figures in plain Python from Builder.sample (the synthetic
      rows, in schema field order) without using any workbook formula, and compares
@@ -3499,7 +3798,17 @@ import build_workbook as bw  # noqa: E402
 YEAR = 2026
 SAMPLE_DAYS = 74
 REPORT_DATE = date(YEAR, 2, 10)
-CHECK_DATES = [date(YEAR, 1, 1), date(YEAR, 2, 10), date(YEAR, 3, 15)]
+CHECK_DATES = [date(YEAR, 1, 1), REPORT_DATE, date(YEAR, 1, 1) + timedelta(days=SAMPLE_DAYS - 1)]
+EDGE_DATES = [date(YEAR, 2, d) for d in (5, 6, 7, 8, 9, 10)]
+
+
+def set_year(year: int):
+    """Point every date expectation at another reporting year (--year 2028 exercises the leap-year branch)."""
+    global YEAR, REPORT_DATE, CHECK_DATES, EDGE_DATES
+    YEAR = year
+    REPORT_DATE = date(YEAR, 2, 10)
+    CHECK_DATES = [date(YEAR, 1, 1), REPORT_DATE, date(YEAR, 1, 1) + timedelta(days=SAMPLE_DAYS - 1)]
+    EDGE_DATES = [date(YEAR, 2, d) for d in (5, 6, 7, 8, 9, 10)]
 TOL_SUM = 1e-6      # relative tolerance for additive figures (tonnes, ounces, hours, counts)
 TOL_RATIO = 1e-4    # relative tolerance for ratios, grades, rates and pro-rata budgets
 TOL_SAME = 1e-9     # two cells of the same recalculated workbook that must agree
@@ -3610,8 +3919,9 @@ class Checks:
 class Sample:
     """Builder.sample rows (list of lists in schema field order) as dicts keyed by field name."""
 
-    def __init__(self, builder):
+    def __init__(self, builder, sample: dict | None = None):
         self.b = builder
+        self.sample = sample if sample is not None else builder.sample
         s = builder.s
         self.troy = float(s["constants"]["TROY_OZ_G"])
         self.fields = {t["table"]: [f["name"] for f in t["fields"] if not f.get("calc")] for t in s["tables"]}
@@ -3627,7 +3937,7 @@ class Sample:
             return self._cache[table]
         names = self.fields[table]
         out = []
-        for row in self.b.sample.get(table, []):
+        for row in self.sample.get(table, []):
             if len(row) != len(names):
                 self.width_problems.append(f"{table}: row has {len(row)} values for {len(names)} fields")
             out.append({n: (row[i] if i < len(row) else None) for i, n in enumerate(names)})
@@ -3668,14 +3978,19 @@ KIND = {
     "Gold_Poured_oz": True, "Throughput_tph": False, "Mill_Availability_pct": False, "Mill_Utilisation_pct": False,
     "Cyanide_kgpt": False, "Hours_Worked": True, "Recordables": True, "LTI": True, "Gold_Shipped_oz": True, "Gold_Sold_oz": True,
     "GIC_oz": True, "Days_Since_LTI": True, "TRIFR_12m": False, "LTIFR_12m": False,
+    "Ore_Ungraded_t": True, "Unclassified_t": True, "Tails_Grade_gpt": False, "Mill_Calendar_h": True,
+    "GC_Drill_m": True, "Gravity_Share_pct": False, "Exc_Productivity_tph": False, "Trk_Productivity_tph": False,
     "Bud_Milled_t_MTD": False, "Bud_Milled_t_YTD": False, "Bud_Ore_Grade_gpt_MTD": False, "Bud_Recovery_pct_YTD": False,
 }
 
 
 def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
-    """Recompute the KPI set for one date, per period, straight from the sample rows."""
+    """Recompute the KPI set for one date, per period, straight from the sample rows.
+    Blank means not reported: a row whose grade, tails grade or run hours is blank contributes nothing to the
+    ratio that needs it (the tonnes are paired with the assay or the hours that carry them)."""
     T = S.troy
     mv, pl, sf, gd = S.rows("tblMovement"), S.rows("tblPlant"), S.rows("tblSafety"), S.rows("tblGold")
+    md, fl = S.rows("tblMiningDaily"), S.rows("tblFleet")
 
     def pit(r):
         return S.src_type.get(r["Source"]) == "Pit"
@@ -3683,14 +3998,23 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
     def pit_ore(r):
         return pit(r) and S.is_ore(r["Material"])
 
+    def graded(r):
+        return r.get("Grade_gpt") is not None
+
     def milled(r):
         return num(r["Milled_t"])
 
+    def has(r, *cols):
+        return all(r[c] is not None for c in cols)
+
     def feed_oz(r):
-        return milled(r) * num(r["Head_Grade_gpt"]) / T
+        return milled(r) * num(r["Head_Grade_gpt"]) / T if has(r, "Milled_t", "Head_Grade_gpt") else 0.0
+
+    def tails_oz(r):
+        return milled(r) * num(r["Tails_Grade_gpt"]) / T if has(r, "Milled_t", "Tails_Grade_gpt") else 0.0
 
     def rec_oz(r):
-        return milled(r) * (num(r["Head_Grade_gpt"]) - num(r["Tails_Grade_gpt"])) / T
+        return feed_oz(r) - tails_oz(r) if has(r, "Milled_t", "Head_Grade_gpt", "Tails_Grade_gpt") else 0.0
 
     def hours(r):
         return num(r["Hours_Employees"]) + num(r["Hours_Contractors"])
@@ -3705,37 +4029,52 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
 
     for p in ("Day", "MTD", "YTD"):
         ore_t = total(mv, d, p, lambda r: float(r["Tonnes_t"]) if pit_ore(r) else 0.0)
+        ore_graded_t = total(mv, d, p, lambda r: float(r["Tonnes_t"]) if pit_ore(r) and graded(r) else 0.0)
         ore_oz = total(mv, d, p, lambda r: S.oz(r) if pit_ore(r) else 0.0)
         waste_t = total(mv, d, p, lambda r: float(r["Tonnes_t"]) if pit(r) and not S.is_ore(r["Material"]) else 0.0)
         rehandle = total(mv, d, p, lambda r: float(r["Tonnes_t"]) if S.src_type.get(r["Source"]) == "Stockpile" else 0.0)
+        moved = total(mv, d, p, lambda r: float(r["Tonnes_t"]))
         mil = total(pl, d, p, milled)
+        mil_head = total(pl, d, p, lambda r: milled(r) if r["Head_Grade_gpt"] is not None else 0.0)
+        mil_tails = total(pl, d, p, lambda r: milled(r) if r["Tails_Grade_gpt"] is not None else 0.0)
+        mil_timed = total(pl, d, p, lambda r: milled(r) if r["Mill_Run_h"] is not None else 0.0)
         fz = total(pl, d, p, feed_oz)
+        fz_recon = total(pl, d, p, lambda r: feed_oz(r) if r["Tails_Grade_gpt"] is not None else 0.0)
+        tz = total(pl, d, p, tails_oz)
         rz = total(pl, d, p, rec_oz)
         poured = total(pl, d, p, lambda r: num(r["Gold_Poured_oz"]))
         run_h = total(pl, d, p, lambda r: num(r["Mill_Run_h"]))
         plan_h = total(pl, d, p, lambda r: num(r["Mill_Planned_Maint_h"]))
         unpl_h = total(pl, d, p, lambda r: num(r["Mill_Unplanned_Down_h"]))
-        cal_h = total(pl, d, p, lambda r: 24.0 if r["Mill_Run_h"] is not None else 0.0)
+        cal_h = total(pl, d, p, lambda r: 24.0 if any(r[c] is not None for c in ("Mill_Run_h", "Mill_Planned_Maint_h", "Mill_Unplanned_Down_h")) else 0.0)
         cn_kg = total(pl, d, p, lambda r: num(r["Cyanide_kg"]))
         hrs = total(sf, d, p, hours)
         rec = total(sf, d, p, recordables)
         lti = total(sf, d, p, lambda r: num(r["LTI"]))
         shipped = total(gd, d, p, lambda r: num(r["Gold_oz"]) if r["Type"] == "Shipment" else 0.0)
+        gravity = total(pl, d, p, lambda r: num(r["Gravity_Gold_oz"]))
+        gc_m = total(md, d, p, lambda r: num(r["GC_Drill_m"]))
+        exc_h = total(fl, d, p, lambda r: num(r["Operating_h"]) if r["Equipment_Class"] == "Excavator" else 0.0)
+        trk_h = total(fl, d, p, lambda r: num(r["Operating_h"]) if r["Equipment_Class"] == "Haul Truck" else 0.0)
         sold = total(gd, d, p, lambda r: num(r["Gold_oz"]) if r["Type"] == "Sale" else 0.0)
         put("Ore_Mined_t", p, ore_t)
         put("Ore_Mined_oz", p, ore_oz)
-        put("Ore_Grade_gpt", p, div(ore_oz * T, ore_t))
+        put("Ore_Grade_gpt", p, div(ore_oz * T, ore_graded_t))
+        put("Ore_Ungraded_t", p, ore_t - ore_graded_t)
         put("Waste_t", p, waste_t)
         put("TMM_t", p, ore_t + waste_t)
         put("Strip_Ratio", p, div(waste_t, ore_t))
         put("Rehandle_t", p, rehandle)
+        put("Unclassified_t", p, moved - ore_t - waste_t - rehandle)
         put("Milled_t", p, mil)
         put("Feed_oz", p, fz)
         put("Recovered_oz", p, rz)
-        put("Head_Grade_gpt", p, div(fz * T, mil))
-        put("Recovery_pct", p, div(rz, fz))
+        put("Head_Grade_gpt", p, div(fz * T, mil_head))
+        put("Tails_Grade_gpt", p, div(tz * T, mil_tails))
+        put("Recovery_pct", p, div(rz, fz_recon))
         put("Gold_Poured_oz", p, poured)
-        put("Throughput_tph", p, div(mil, run_h))
+        put("Throughput_tph", p, div(mil_timed, run_h))
+        put("Mill_Calendar_h", p, cal_h)
         put("Mill_Availability_pct", p, div(cal_h - plan_h - unpl_h, cal_h))
         put("Mill_Utilisation_pct", p, div(run_h, cal_h - plan_h - unpl_h))
         put("Cyanide_kgpt", p, div(cn_kg, mil))
@@ -3743,6 +4082,10 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
         put("Recordables", p, rec)
         put("LTI", p, lti)
         put("Gold_Shipped_oz", p, shipped)
+        put("GC_Drill_m", p, gc_m)
+        put("Gravity_Share_pct", p, div(gravity, rz))
+        put("Exc_Productivity_tph", p, div(ore_t + waste_t + rehandle, exc_h))
+        put("Trk_Productivity_tph", p, div(ore_t + waste_t + rehandle, trk_h))
         put("Gold_Sold_oz", p, sold)
     # point value: gold in circuit on the day
     gic = total(pl, d, "Day", lambda r: num(r["GIC_oz"]))
@@ -3752,14 +4095,19 @@ def expected_kpis(S: Sample, d: date) -> dict[str, dict[str, object]]:
     lti_days = [r["Date"] for r in sf if num(r["LTI"]) > 0 and r["Date"] <= d]
     cands = [x for x in (prior, max(lti_days) if lti_days else None) if x]
     put("Days_Since_LTI", "Day", float((d - max(cands)).days) if cands else None)
-    # rolling 12 months + month to date: window from the same month one year earlier
+    # rolling 12 months + month to date: window from the same month one year earlier; history months are used
+    # for months in the window before the current month that have no daily hours
     hist = S.rows("tblSafetyHistory")
     ms = date(d.year, d.month, 1)
     win = date(ms.year - 1, ms.month, 1)
-    ys = date(d.year, 1, 1)
+
+    def use_hist(h):
+        m = h["Month"]
+        return win <= m < ms and not any(hours(r) > 0 for r in sf if (r["Date"].year, r["Date"].month) == (m.year, m.month))
+
     for key, cur_fn, hist_col in (("TRIFR_12m", recordables, "Recordables"), ("LTIFR_12m", lambda r: num(r["LTI"]), "LTI")):
-        n = sum(cur_fn(r) for r in sf if win <= r["Date"] <= d) + sum(num(h[hist_col]) for h in hist if win <= h["Month"] < ys)
-        dd = sum(hours(r) for r in sf if win <= r["Date"] <= d) + sum(num(h["Hours_Total"]) for h in hist if win <= h["Month"] < ys)
+        n = sum(cur_fn(r) for r in sf if win <= r["Date"] <= d) + sum(num(h[hist_col]) for h in hist if use_hist(h))
+        dd = sum(hours(r) for r in sf if win <= r["Date"] <= d) + sum(num(h["Hours_Total"]) for h in hist if use_hist(h))
         put(key, "Day", n / dd * 1_000_000 if dd > 0 else None)
     return out
 
@@ -3794,17 +4142,19 @@ def expected_budgets(S: Sample, d: date) -> dict[str, object]:
 
 
 def expected_stockpiles(S: Sample, rd: date) -> list[dict]:
+    """Balance window per stockpile: from the later of 1 January and its Survey_Date (opening = start of that day) to rd."""
     T = S.troy
-    mv = [r for r in S.rows("tblMovement") if r["Date"] <= rd]
-    pl = [r for r in S.rows("tblPlant") if r["Date"] <= rd]
-    milled = sum(num(r["Milled_t"]) for r in pl)
-    feed_oz = sum(num(r["Milled_t"]) * num(r["Head_Grade_gpt"]) / T for r in pl)
-    tip = [r for r in mv if S.dst_type.get(r["Destination"]) == "Plant"]
-    tip_t = sum(float(r["Tonnes_t"]) for r in tip)
-    tip_oz = sum(S.oz(r) for r in tip)
     out = []
     for sp in S.rows("tblStockpiles"):
         nm, op_t, op_g = sp["Stockpile"], num(sp["Opening_t"]), num(sp["Opening_gpt"])
+        since = max(date(rd.year, 1, 1), as_date(sp["Survey_Date"]) or date(rd.year, 1, 1))
+        mv = [r for r in S.rows("tblMovement") if since <= r["Date"] <= rd]
+        pl = [r for r in S.rows("tblPlant") if since <= r["Date"] <= rd]
+        milled = sum(num(r["Milled_t"]) for r in pl)
+        feed_oz = sum(num(r["Milled_t"]) * num(r["Head_Grade_gpt"]) / T for r in pl)
+        tip = [r for r in mv if S.dst_type.get(r["Destination"]) == "Plant"]
+        tip_t = sum(float(r["Tonnes_t"]) for r in tip)
+        tip_oz = sum(S.oz(r) for r in tip)
         feeds = sp["Plant_Feed"] == "Y"
         ins = [r for r in mv if r["Destination"] == nm]
         outs = [r for r in mv if r["Source"] == nm]
@@ -3871,40 +4221,65 @@ def scan_errors(wb, allowed) -> dict[str, list[str]]:
     return found
 
 
-def chart_guard_allowed(wb, series, last):
-    """Only #N/A in guarded Chart_Data columns for dates after the last data date is acceptable."""
+def chart_gap_ok(cd, src: str, d: date, last) -> bool:
+    """A guarded Chart_Data cell may be #N/A after the last data date, or where the Calc_Daily value is not a number (blank ratio)."""
+    return last is None or d > last or (cd is not None and not is_num(cd.get(d, src)))
+
+
+def chart_guard_allowed(wb, series, last, cd=None):
+    """Only #N/A in guarded Chart_Data columns is acceptable, and only where chart_gap_ok says so."""
     ws = wb["Chart_Data"]
-    guarded_cols = {j + 1 for j, s in enumerate(series) if s[2]}
+    guarded = {j + 1: s[1] for j, s in enumerate(series) if s[2]}
 
     def allowed(sheet, c):
-        if sheet != "Chart_Data" or c.value != "#N/A" or c.column not in guarded_cols:
+        if sheet != "Chart_Data" or c.value != "#N/A" or c.column not in guarded:
             return False
         d = as_date(ws.cell(c.row, 1).value)
-        return d is not None and (last is None or d > last)
+        return d is not None and chart_gap_ok(cd, guarded[c.column], d, last)
 
     return allowed
 
 
 # ----------------------------------------------------------------------------- checks
-def check_calc_daily(C: Checks, S: Sample, cd: CalcDaily):
-    for d in CHECK_DATES:
+def check_calc_daily(C: Checks, S: Sample, cd: CalcDaily, dates=None, tag="Calc_Daily", budgets=True):
+    for d in dates or CHECK_DATES:
         exp = expected_kpis(S, d)
         for key, periods in exp.items():
             for period, val in periods.items():
                 hdr = key if period == "Day" else f"{key}_{period}"
-                C.num(f"Calc_Daily {d} {hdr}", val, cd.get(d, hdr), TOL_SUM if KIND[key] else TOL_RATIO)
-        for hdr, val in expected_budgets(S, d).items():
-            C.num(f"Calc_Daily {d} {hdr}", val, cd.get(d, hdr), TOL_RATIO)
+                C.num(f"{tag} {d} {hdr}", val, cd.get(d, hdr), TOL_SUM if KIND[key] else TOL_RATIO)
+        if budgets:
+            for hdr, val in expected_budgets(S, d).items():
+                C.num(f"{tag} {d} {hdr}", val, cd.get(d, hdr), TOL_RATIO)
+
+
+def expected_checks_line(S: Sample, rd: date) -> str:
+    """The Daily_Report B7 completeness line, from the sample rows."""
+    def n(table, cond=lambda r: True):
+        return sum(1 for r in S.rows(table) if r["Date"] == rd and cond(r))
+    mv = S.rows("tblMovement")
+    unknown = sum(1 for r in mv if r["Source"] and r["Source"] not in S.src_type) + sum(1 for r in mv if r["Destination"] and r["Destination"] not in S.dst_type)
+    outside = sum(1 for r in mv if r["Date"].year != rd.year)
+    return (f"Rows for this date: Plant {n('tblPlant', lambda r: r['Milled_t'] is not None)}, Movements {n('tblMovement')}, Fleet {n('tblFleet')}, "
+            f"Mining daily {n('tblMiningDaily', lambda r: r['Diesel_L'] is not None)}, Safety {n('tblSafety', lambda r: r['Hours_Employees'] is not None)}, "
+            f"Comments {n('tblCommentary')}  |  Movement rows with unknown source or destination: {unknown}  |  Movement rows dated outside the year: {outside}")
 
 
 def var(a, b):
     return a / b - 1 if is_num(a) and is_num(b) and b != 0 else None
 
 
-def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date):
+def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date, tag="Daily_Report"):
     ws = wb["Daily_Report"]
-    C.eq("Daily_Report C5 report date", rd, ws["C5"].value)
-    C.eq("Daily_Report rpt_Row (L5) = day of year", float((rd - date(YEAR, 1, 1)).days + 1), ws["L5"].value)
+    C.eq(f"{tag} C5 report date", rd, ws["C5"].value)
+    C.eq(f"{tag} rpt_Row (L5) = day of year", float((rd - date(YEAR, 1, 1)).days + 1), ws["L5"].value)
+    C.eq(f"{tag} B7 completeness line (rpt_Checks)", expected_checks_line(S, rd), ws["B7"].value)
+    C.eq(f"{tag} F5 warning blank (date in year, year check OK)", None, norm(ws["F5"].value))
+    C.add(f"{tag} B6 header shows data-to date and week", "Data to ... | Week ...", fmt(ws["B6"].value),
+          isinstance(ws["B6"].value, str) and ws["B6"].value.startswith("Data to ") and "Week " in ws["B6"].value)
+    C.eq(f"{tag} cfg_FeedCheck (exactly one Plant_Feed = Y)", "OK", config_values(wb).get("cfg_FeedCheck"))
+    r0 = find_row(ws, 2, "STOCKPILES")
+    C.eq(f"{tag} plant feed warning line blank", None, ws.cell(r0 - 1, 2).value if r0 else "<no STOCKPILES block>")
     rows: dict[str, int] = {}
     for r in range(1, ws.max_row + 1):
         v = ws.cell(r, 2).value
@@ -3934,7 +4309,7 @@ def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date):
                 got = norm(ws.cell(r, col).value)
                 if not close(w, got, TOL_SAME):
                     mism.append(f"{k['label']} {get_column_letter(col)}{r} exp {fmt(w)} got {fmt(got)}")
-        C.group(f"Daily_Report {section} cells vs Calc_Daily", n, mism)
+        C.group(f"{tag} {section} cells vs Calc_Daily", n, mism)
     # stockpiles, recomputed independently
     r0 = find_row(ws, 2, "STOCKPILES")
     exp_sp = expected_stockpiles(S, rd)
@@ -3950,8 +4325,8 @@ def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date):
                 mism.append(f"{e['name']} {get_column_letter(col)}{r} exp {fmt(e[key])} got {fmt(got.get(col))}")
         if not (e["bal"] >= 0 and (e["grade"] is None or 0 <= e["grade"] <= 10)):
             plaus.append(f"{e['name']} balance {fmt(e['bal'])} t at {fmt(e['grade'])} g/t")
-    C.group("Daily_Report stockpile block (independent)", n, mism)
-    C.group("Daily_Report stockpile balances plausible (t >= 0, 0 to 10 g/t)", len(exp_sp), plaus)
+    C.group(f"{tag} stockpile block (independent)", n, mism)
+    C.group(f"{tag} stockpile balances plausible (t >= 0, 0 to 10 g/t)", len(exp_sp), plaus)
     # commentary in entry order
     r0 = find_row(ws, 2, "COMMENTARY")
     comments = [(c["Area"], c["Comment"]) for c in S.rows("tblCommentary") if c["Date"] == rd]
@@ -3963,8 +4338,8 @@ def check_daily_report(C: Checks, S: Sample, b, wb, cd: CalcDaily, rd: date):
         n += 1
         if got != e:
             mism.append(f"line {i + 1} exp {e} got {got}")
-    C.add("Daily_Report commentary lines for report date", f"{len(comments)} comments, entry order", f"{len(comments)} comments" if not mism else mism[0], not mism)
-    C.add("Daily_Report commentary count fits the block", f"<= {bw.COMMENT_LINES}", str(len(comments)), len(comments) <= bw.COMMENT_LINES)
+    C.add(f"{tag} commentary lines for report date", f"{len(comments)} comments, entry order", f"{len(comments)} comments" if not mism else mism[0], not mism)
+    C.add(f"{tag} commentary count fits the block", f"<= {bw.COMMENT_LINES}", str(len(comments)), len(comments) <= bw.COMMENT_LINES)
 
 
 def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
@@ -3978,11 +4353,13 @@ def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
     r = actual_rows[bw.KPI["Milled_t"]["label"]]
     pl = S.rows("tblPlant")
     bud = {row["Month"]: row for row in S.rows("tblBudget")}
+    # budget: full month, except the month in progress (pro-rata to the last data date); year = YTD budget at that date
     exp_act, exp_bud = {}, {}
     for m in range(1, 13):
         ms = date(YEAR, m, 1)
         exp_act[m] = sum(num(p["Milled_t"]) for p in pl if p["Date"].month == m and p["Date"] <= last) if ms <= last else None
-        exp_bud[m] = num(bud[ms]["Milled_t"]) if ms in bud else 0.0
+        full = num(bud[ms]["Milled_t"]) if ms in bud else 0.0
+        exp_bud[m] = full * last.day / calendar.monthrange(YEAR, m)[1] if m == last.month else full
     for m in (1, 2, 3, 4):
         C.num(f"Monthly_Summary Milled {MONTHS[m - 1]} actual", exp_act[m], ws.cell(r, 3 + m).value)
     ytd = sum(num(p["Milled_t"]) for p in pl if p["Date"] <= last)
@@ -3990,18 +4367,18 @@ def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
     mism_b, mism_v = [], []
     for m in range(1, 13):
         got_b = norm(ws.cell(r + 1, 3 + m).value)
-        if not close(exp_bud[m], got_b, TOL_SUM):
+        if not close(exp_bud[m], got_b, TOL_RATIO):
             mism_b.append(f"{MONTHS[m - 1]} exp {fmt(exp_bud[m])} got {fmt(got_b)}")
         got_v = norm(ws.cell(r + 2, 3 + m).value)
         ev = var(exp_act[m], exp_bud[m])
         if not close(ev, got_v, TOL_RATIO):
             mism_v.append(f"{MONTHS[m - 1]} exp {fmt(ev)} got {fmt(got_v)}")
-    annual = sum(exp_bud.values())
-    if not close(annual, ws.cell(r + 1, 16).value, TOL_SUM):
-        mism_b.append(f"Year exp {fmt(annual)} got {fmt(ws.cell(r + 1, 16).value)}")
-    if not close(var(ytd, annual), ws.cell(r + 2, 16).value, TOL_RATIO):
-        mism_v.append(f"Year exp {fmt(var(ytd, annual))} got {fmt(ws.cell(r + 2, 16).value)}")
-    C.group("Monthly_Summary Milled budget row = tblBudget (12 months + year)", 13, mism_b)
+    ytd_bud = sum(v for m, v in exp_bud.items() if m <= last.month)
+    if not close(ytd_bud, ws.cell(r + 1, 16).value, TOL_RATIO):
+        mism_b.append(f"Year exp {fmt(ytd_bud)} got {fmt(ws.cell(r + 1, 16).value)}")
+    if not close(var(ytd, ytd_bud), ws.cell(r + 2, 16).value, TOL_RATIO):
+        mism_v.append(f"Year exp {fmt(var(ytd, ytd_bud))} got {fmt(ws.cell(r + 2, 16).value)}")
+    C.group("Monthly_Summary Milled budget row = tblBudget, pro-rata for the current month (12 months + year)", 13, mism_b)
     C.group("Monthly_Summary Milled variance row = actual / budget - 1", 13, mism_v)
     # every monthly KPI row against Calc_Daily
     mism, n = [], 0
@@ -4022,7 +4399,7 @@ def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
                 mism.append(f"{k['label']} {MONTHS[m - 1]} exp {fmt(want)} got {fmt(got)}")
             if b.has_budget(k):
                 n += 1
-                wb_ = cd.get(ms, f"Bud_{key}_Month")
+                wb_ = cd.get(me, f"Bud_{key}_MTD") if ms <= last else cd.get(ms, f"Bud_{key}_Month")
                 got_b = norm(ws.cell(r + 1, 3 + m).value)
                 if not close(wb_, got_b, TOL_SAME):
                     mism.append(f"{k['label']} {MONTHS[m - 1]} budget exp {fmt(wb_)} got {fmt(got_b)}")
@@ -4034,10 +4411,10 @@ def check_monthly(C: Checks, S: Sample, b, wb, cd: CalcDaily, last: date):
     C.group("Monthly_Summary all KPI rows vs Calc_Daily", n, mism)
 
 
-def check_chart_data(C: Checks, wb, series, last: date):
+def check_chart_data(C: Checks, wb, series, last: date, cd=None):
     ws = wb["Chart_Data"]
     rows = list(ws.iter_rows(values_only=True))
-    for j, (name, _src, guard) in enumerate(series):
+    for j, (name, src, guard) in enumerate(series):
         if j == 0:
             continue
         bad = []
@@ -4046,12 +4423,12 @@ def check_chart_data(C: Checks, wb, series, last: date):
             if d is None:
                 continue
             v = row[j]
-            if guard and d > last:
+            if guard and (d > last or (cd is not None and not is_num(cd.get(d, src)))):
                 if v != "#N/A":
                     bad.append(f"{d} {fmt(v)}")
             elif not is_num(v):
                 bad.append(f"{d} {fmt(v)}")
-        label = "NA after last data date, numeric before" if guard else "numeric all year"
+        label = "NA after last data date or blank KPI, numeric before" if guard else "numeric all year"
         C.group(f"Chart_Data {name} ({label})", len(rows) - 1, bad)
 
 
@@ -4082,6 +4459,10 @@ def check_blank(C: Checks, wb, series):
     ws = wb["Daily_Report"]
     title = norm(ws["B2"].value)
     C.add("Blank Daily_Report title renders", "text", fmt(title), isinstance(title, str) and bool(title))
+    C.eq("Blank cfg_FeedCheck (schema stockpiles)", "OK", cfg.get("cfg_FeedCheck"))
+    C.add("Blank Daily_Report B7 completeness line all zero", "Plant 0 ... outside the year: 0", fmt(ws["B7"].value),
+          isinstance(ws["B7"].value, str) and ws["B7"].value.startswith("Rows for this date: Plant 0, Movements 0, Fleet 0, Mining daily 0, Safety 0, Comments 0")
+          and ws["B7"].value.endswith("outside the year: 0"))
     today = date.today()
     exp_default = max(date(YEAR, 1, 1), min(today - timedelta(days=1), date(YEAR, 12, 31)))
     c5 = as_date(ws["C5"].value)
@@ -4100,6 +4481,106 @@ def check_blank(C: Checks, wb, series):
                 if v is not None and v != 0:
                     bad.append(f"{get_column_letter(col)}{r}={fmt(v)}")
     C.group("Blank Daily_Report KPI cells blank or zero", n, bad)
+
+
+# ----------------------------------------------------------------------------- edge workbook and list probe
+def list_catalogue(schema: dict) -> dict[str, list]:
+    """Every lst_ name the generator defines: schema lists, derived lists and the key column of Lists-sheet reference tables."""
+    out = dict(schema["lists"])
+    out.update(schema.get("derived_lists", {}))
+    for rdef in schema["reference_tables"].values():
+        if rdef["sheet"] == "Lists":
+            out[rdef["key"]] = [row[0] for row in rdef["rows"]]
+    return out
+
+
+def make_edge(b, out: Path) -> Sample:
+    """Copy the demo builder's workbook and sample with partially entered rows, add the lst_ probe sheet, save."""
+    import copy
+    smp = copy.deepcopy(b.sample)
+    S = Sample(b, smp)
+    wb = b.wb
+    edits = {  # table -> (row date, {field: value})
+        "tblPlant": [(date(YEAR, 2, 5), {"Tails_Grade_gpt": None}), (date(YEAR, 2, 6), {"Head_Grade_gpt": None}),
+                     (date(YEAR, 2, 7), {"Mill_Run_h": None}),
+                     (date(YEAR, 2, 8), {"Milled_t": 0, "Mill_Run_h": None, "Mill_Planned_Maint_h": 24, "Mill_Unplanned_Down_h": 0})],
+    }
+    for tbl, items in edits.items():
+        info = b.tables[tbl]
+        ws = wb[info["sheet"]]
+        names = S.fields[tbl]
+        for d, vals in items:
+            r = info["first"] + (d - date(YEAR, 1, 1)).days
+            row = smp[tbl][(d - date(YEAR, 1, 1)).days]
+            assert row[0] == d
+            for k, v in vals.items():
+                row[names.index(k)] = v
+                ws[f"{info['cols'][k]}{r}"] = v
+    # ungraded ore row on 9 Feb (first Petowal Pit Ore HG row of that day), an unknown source and a prior-year row
+    info = b.tables["tblMovement"]
+    ws = wb[info["sheet"]]
+    names = S.fields["tblMovement"]
+    mv = smp["tblMovement"]
+    i9 = next(i for i, row in enumerate(mv) if row[0] == date(YEAR, 2, 9) and row[3] == "Ore HG")
+    mv[i9][names.index("Grade_gpt")] = None
+    ws[f"{info['cols']['Grade_gpt']}{info['first'] + i9}"] = None
+    extra = [[date(YEAR - 1, 12, 31), None, "Petowal Pit", "Ore HG", "ROM Pad", 777, 2.0, None, None, None],
+             [date(YEAR, 2, 10), None, "Unknown Pit", "Ore HG", "ROM Pad", 1000, 2.0, None, None, None]]
+    for row in extra:
+        r = info["first"] + len(mv)
+        mv.append(row)
+        for k, v in zip(names, row):
+            if v is not None:
+                ws[f"{info['cols'][k]}{r}"] = v
+    # re-surveyed stockpile: Stockpile LG opening reset on 1 Feb (movements and plant rows before that day leave its balance)
+    info = b.tables["tblStockpiles"]
+    ws = wb[info["sheet"]]
+    i_lg = next(i for i, row in enumerate(smp["tblStockpiles"]) if row[0] == "Stockpile LG")
+    names = S.fields["tblStockpiles"]
+    for k, v in (("Opening_t", 160000), ("Opening_gpt", 0.58), ("Survey_Date", date(YEAR, 2, 1))):
+        smp["tblStockpiles"][i_lg][names.index(k)] = v
+        ws[f"{info['cols'][k]}{info['first'] + i_lg}"] = v
+    # probe sheet: size, first and last entry of every drop-down name
+    pr = wb.create_sheet("Probe")
+    pr.append(["name", "rows", "first", "last"])
+    for lname in list_catalogue(b.s):
+        pr.append([lname, f"=ROWS(lst_{lname})", f"=INDEX(lst_{lname},1)", f"=INDEX(lst_{lname},ROWS(lst_{lname}))"])
+    wb.save(out)
+    S._cache.clear()
+    return S
+
+
+def check_lists(C: Checks, b, wb_edge):
+    """Every lst_ name covers exactly the schema list (F001), and every list field validates against its name."""
+    cat = list_catalogue(b.s)
+    got = {row[0]: row[1:] for row in wb_edge["Probe"].iter_rows(min_row=2, values_only=True) if row[0]}
+    bad = []
+    for lname, values in cat.items():
+        g = got.get(lname)
+        exp = (float(len(values)), values[0], values[-1])
+        if g is None or tuple(norm(x) for x in g) != exp:
+            bad.append(f"lst_{lname} exp {exp} got {g}")
+    C.group("Lists: ROWS/first/last of every lst_ name = schema list (LibreOffice)", len(cat), bad)
+    bad, n = [], 0
+    fields = [(t["table"], f) for t in b.s["tables"] for f in t["fields"]]
+    fields += [(rdef["table"], c) for rdef in b.s["reference_tables"].values() for c in rdef["columns"]]
+    for tbl, f in fields:
+        if f.get("type") != "list":
+            continue
+        n += 1
+        info = b.tables[tbl]
+        ws = b.wb[info["sheet"]]
+        want = f"=lst_{f['list']}"
+        col_ref = f"{info['cols'][f['name']]}{info['first']}"
+        dvs = [dv for dv in ws.data_validations.dataValidation if dv.formula1 == want and col_ref in dv.sqref]
+        if not dvs:
+            bad.append(f"{tbl}[{f['name']}] has no list validation {want} on {col_ref}")
+        elif f"lst_{f['list']}" not in b.wb.defined_names:
+            bad.append(f"{tbl}[{f['name']}]: name lst_{f['list']} missing")
+    C.group("Lists: every list field validates against an existing lst_ name", n, bad)
+    req = [f"{r}.Type" for r, rdef in b.s["reference_tables"].items() if r in ("Sources", "Destinations")
+           and not any(c["name"] == "Type" and c.get("required") for c in rdef["columns"])]
+    C.group("Schema: Sources.Type and Destinations.Type are required", 2, [f"{x} not required" for x in req])
 
 
 # ----------------------------------------------------------------------------- driver
@@ -4125,7 +4606,9 @@ def main(argv=None) -> int:
     ap.add_argument("--workdir", default=None, help="folder for the built files (default: a fresh temp folder)")
     ap.add_argument("--soffice", default=shutil.which("soffice") or shutil.which("libreoffice") or "soffice", help="LibreOffice executable")
     ap.add_argument("--schema", default=str(bw.DEFAULT_SCHEMA))
+    ap.add_argument("--year", type=int, default=YEAR, help="reporting year to build and check (2028 exercises the leap-year branch)")
     a = ap.parse_args(argv)
+    set_year(a.year)
 
     t0 = time.time()
     auto = a.workdir is None
@@ -4138,23 +4621,30 @@ def main(argv=None) -> int:
     try:
         print(f"work folder: {work}")
         print("building workbooks ...", flush=True)
-        f_demo, f_default, f_blank = built / "MPS_demo.xlsx", built / "MPS_demo_default_date.xlsx", built / "MPS_blank.xlsx"
+        f_demo, f_default, f_blank, f_edge = built / "MPS_demo.xlsx", built / "MPS_demo_default_date.xlsx", built / "MPS_blank.xlsx", built / "MPS_edge.xlsx"
         b = bw.build(schema, f_demo, YEAR, SAMPLE_DAYS, REPORT_DATE)
         bw.build(schema, f_default, YEAR, SAMPLE_DAYS, None)
         bw.build(schema, f_blank, YEAR, 0, None)
         S = Sample(b)
+        S_edge = make_edge(b, f_edge)   # after Sample(b): the edge edits the builder's workbook in place
         last = S.last_plant_date()
         C.eq("Sample last day with data", CHECK_DATES[-1], last)
         # the Config cell must hold the formula, not a pasted date (the earlier override bug)
         ref = b.wb.defined_names["cfg_LastDataDate"].attr_text.split("!")[1].replace("$", "")
         cell = b.wb["Config"][ref].value
         C.add("Config cfg_LastDataDate is a formula", "=...", str(cell)[:30], isinstance(cell, str) and cell.startswith("="))
+        dvs = [dv for dv in b.wb["Daily_Report"].data_validations.dataValidation if "C5" in str(dv.sqref)]
+        C.add("Daily_Report C5 stop validation: date within the year", "date, stop, cfg_YearStart..cfg_YearEnd",
+              f"{dvs[0].type}, {dvs[0].errorStyle}, {dvs[0].formula1}..{dvs[0].formula2}" if dvs else "none",
+              bool(dvs) and dvs[0].type == "date" and dvs[0].errorStyle == "stop" and dvs[0].formula1 == "=cfg_YearStart" and dvs[0].formula2 == "=cfg_YearEnd")
+        C.add("Daily_Report C5 default formula matches the restore hint", "same text", "same" if dvs and bw.DEFAULT_DATE_FORMULA in (dvs[0].prompt or "") else "differs",
+              bool(dvs) and bw.DEFAULT_DATE_FORMULA in (dvs[0].prompt or ""))
         for t in S.fields:
             S.rows(t)
         C.group("Sample rows match schema field order (width)", len(S.fields), S.width_problems)
 
         print("recalculating with LibreOffice ...", flush=True)
-        r_demo, r_default, r_blank = recalc([f_demo, f_default, f_blank], work / "recalc", a.soffice)
+        r_demo, r_default, r_blank, r_edge = recalc([f_demo, f_default, f_blank, f_edge], work / "recalc", a.soffice)
 
         print("checking the DEMO workbook ...", flush=True)
         wb = load(r_demo)
@@ -4164,8 +4654,8 @@ def main(argv=None) -> int:
         check_calc_daily(C, S, cd)
         check_daily_report(C, S, b, wb, cd, REPORT_DATE)
         check_monthly(C, S, b, wb, cd, last)
-        check_chart_data(C, wb, b.chart_series, last)
-        found = scan_errors(wb, chart_guard_allowed(wb, b.chart_series, last))
+        check_chart_data(C, wb, b.chart_series, last, cd)
+        found = scan_errors(wb, chart_guard_allowed(wb, b.chart_series, last, cd))
         C.add("DEMO error values outside the Chart_Data guard", "0",
               str(sum(len(v) for v in found.values())) + (" " + "; ".join(f"{k}: {v[0]}" for k, v in found.items())[:60] if found else ""), not found)
         wb.close()
@@ -4180,6 +4670,17 @@ def main(argv=None) -> int:
         print("checking the blank workbook ...", flush=True)
         wb = load(r_blank)
         check_blank(C, wb, b.chart_series)
+        wb.close()
+
+        print("checking the edge workbook (partial rows) and the drop-down lists ...", flush=True)
+        wb = load(r_edge)
+        cd = CalcDaily(wb["Calc_Daily"])
+        check_calc_daily(C, S_edge, cd, EDGE_DATES, "Edge Calc_Daily", budgets=False)
+        check_daily_report(C, S_edge, b, wb, cd, REPORT_DATE, tag="Edge Daily_Report")
+        found = scan_errors(wb, chart_guard_allowed(wb, b.chart_series, last, cd))
+        C.add("Edge error values outside the Chart_Data guard", "0",
+              str(sum(len(v) for v in found.values())) + (" " + "; ".join(f"{k}: {v[0]}" for k, v in found.items())[:60] if found else ""), not found)
+        check_lists(C, b, wb)
         wb.close()
 
         print("running xl_inspect ...", flush=True)
@@ -4202,7 +4703,7 @@ Write-TextFile (Join-Path $Root "01_Tools\mps\validate_workbook.py") $content_mp
 $content_mps_schema_mps_schema_json = @'
 {
   "system": "Mako Production System",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "site": {
     "name": "Mako Gold Mine",
     "company": "Petowal Mining Company S.A.",
@@ -4230,7 +4731,7 @@ $content_mps_schema_mps_schema_json = @'
       "key": "Source",
       "columns": [
         {"name": "Source", "type": "text", "desc": "Origin of a material movement: a pit or a stockpile"},
-        {"name": "Type", "type": "list", "list": "Source_Type", "desc": "Pit = ex-pit (counts to TMM and strip ratio); Stockpile = rehandle"}
+        {"name": "Type", "type": "list", "list": "Source_Type", "required": true, "required_when": "{Source}<>\"\"", "desc": "Pit = ex-pit (counts to TMM and strip ratio); Stockpile = rehandle. Required: a source without a type is excluded from every KPI"}
       ],
       "rows": [
         ["Petowal Pit", "Pit"],
@@ -4248,7 +4749,7 @@ $content_mps_schema_mps_schema_json = @'
       "key": "Destination",
       "columns": [
         {"name": "Destination", "type": "text", "desc": "Where the material was delivered"},
-        {"name": "Type", "type": "list", "list": "Destination_Type", "desc": "Stockpile = enters a stockpile balance; Plant = direct tip to crusher; Waste = dump"}
+        {"name": "Type", "type": "list", "list": "Destination_Type", "required": true, "required_when": "{Destination}<>\"\"", "desc": "Stockpile = enters a stockpile balance; Plant = direct tip to crusher; Waste = dump. Required"}
       ],
       "rows": [
         ["ROM Pad", "Stockpile"],
@@ -4266,12 +4767,13 @@ $content_mps_schema_mps_schema_json = @'
       "table": "tblStockpiles",
       "sheet": "Config",
       "key": "Stockpile",
+      "spare_rows": 5,
       "columns": [
         {"name": "Stockpile", "type": "text", "desc": "Stockpile name; must match a Source and a Destination"},
-        {"name": "Opening_t", "type": "number", "unit": "t", "desc": "Surveyed tonnes at the start of the year"},
-        {"name": "Opening_gpt", "type": "number", "unit": "g/t", "desc": "Grade of the opening balance"},
-        {"name": "Plant_Feed", "type": "list", "list": "Yes_No", "desc": "Y if the plant draws its feed from this stockpile (milled tonnes are deducted)"},
-        {"name": "Survey_Date", "type": "date", "desc": "Date of the opening survey"}
+        {"name": "Opening_t", "type": "number", "unit": "t", "min": 0, "max": 5000000, "desc": "Surveyed tonnes at the start of Survey_Date (1 January if blank); movements before that day are not part of the balance"},
+        {"name": "Opening_gpt", "type": "number", "unit": "g/t", "min": 0, "max": 50, "desc": "Grade of the opening balance"},
+        {"name": "Plant_Feed", "type": "list", "list": "Yes_No", "desc": "Y for exactly one stockpile: the plant draws its feed from it (milled tonnes less direct tip are deducted, so its balance includes ore tipped to the crusher but not yet milled)"},
+        {"name": "Survey_Date", "type": "date", "desc": "Day the opening balance applies to (balance at the start of that day; blank = 1 January). After a re-survey enter the new tonnes, grade and date here"}
       ],
       "rows": [
         ["ROM Pad", 0, 0, "Y", null],
@@ -4312,13 +4814,13 @@ $content_mps_schema_mps_schema_json = @'
         {"name": "Raw_Water_m3", "label": "Raw water", "unit": "m3", "type": "number", "min": 0, "max": 100000, "desc": "Raw water drawn"},
         {"name": "GIC_oz", "label": "Gold in circuit", "unit": "oz", "type": "number", "min": 0, "max": 50000, "desc": "Gold in circuit at end of day (point value, not additive)"},
         {"name": "Comments", "label": "Comments", "type": "text", "desc": "Short note; use the Commentary sheet for the report narrative"},
-        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "IF({Milled_t}=\"\",\"\",{Milled_t}*{Head_Grade_gpt}/{TROY})", "sql": "milled_t * head_grade_gpt / 31.1035", "desc": "Milled t x head grade / 31.1035"},
-        {"name": "Tails_oz", "label": "Gold lost to tails", "unit": "oz", "type": "number", "calc": "IF({Milled_t}=\"\",\"\",{Milled_t}*{Tails_Grade_gpt}/{TROY})", "sql": "milled_t * tails_grade_gpt / 31.1035", "desc": "Milled t x tails grade / 31.1035"},
-        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "IF({Milled_t}=\"\",\"\",{Feed_oz}-{Tails_oz})", "sql": "milled_t * (head_grade_gpt - tails_grade_gpt) / 31.1035", "desc": "Feed oz minus tails oz"},
-        {"name": "Recovery_pct", "label": "Recovery", "unit": "%", "type": "pct", "calc": "IF(AND({Milled_t}<>\"\",{Feed_oz}>0),{Recovered_oz}/{Feed_oz},\"\")", "sql": "CASE WHEN head_grade_gpt > 0 THEN 1 - tails_grade_gpt / head_grade_gpt END", "desc": "1 minus tails grade over head grade"},
+        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "IF(OR({Milled_t}=\"\",{Head_Grade_gpt}=\"\"),\"\",{Milled_t}*{Head_Grade_gpt}/{TROY})", "sql": "milled_t * head_grade_gpt / {TROY}", "desc": "Milled t x head grade / 31.1035; blank until the head grade is entered"},
+        {"name": "Tails_oz", "label": "Gold lost to tails", "unit": "oz", "type": "number", "calc": "IF(OR({Milled_t}=\"\",{Tails_Grade_gpt}=\"\"),\"\",{Milled_t}*{Tails_Grade_gpt}/{TROY})", "sql": "milled_t * tails_grade_gpt / {TROY}", "desc": "Milled t x tails grade / 31.1035; blank until the tails grade is entered"},
+        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "IF(OR({Milled_t}=\"\",{Head_Grade_gpt}=\"\",{Tails_Grade_gpt}=\"\"),\"\",{Feed_oz}-{Tails_oz})", "sql": "milled_t * (head_grade_gpt - tails_grade_gpt) / {TROY}", "desc": "Feed oz minus tails oz; blank until both grades are entered"},
+        {"name": "Recovery_pct", "label": "Recovery", "unit": "%", "type": "pct", "calc": "IF(AND(ISNUMBER({Recovered_oz}),{Feed_oz}>0),{Recovered_oz}/{Feed_oz},\"\")", "sql": "CASE WHEN head_grade_gpt > 0 THEN 1 - tails_grade_gpt / head_grade_gpt END", "desc": "1 minus tails grade over head grade; blank until both grades are entered"},
         {"name": "Throughput_tph", "label": "Throughput", "unit": "t/h", "type": "number", "calc": "IF(AND({Milled_t}<>\"\",{Mill_Run_h}>0),{Milled_t}/{Mill_Run_h},\"\")", "sql": "CASE WHEN mill_run_h > 0 THEN milled_t / mill_run_h END", "desc": "Milled t per running hour"},
-        {"name": "Availability_pct", "label": "Mill availability", "unit": "%", "type": "pct", "calc": "IF({Mill_Run_h}=\"\",\"\",(24-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})/24)", "sql": "(24 - mill_planned_maint_h - mill_unplanned_down_h) / 24.0", "desc": "(24 h minus planned and unplanned downtime) / 24 h"},
-        {"name": "Utilisation_pct", "label": "Mill utilisation", "unit": "%", "type": "pct", "calc": "IF(AND({Mill_Run_h}<>\"\",(24-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})>0),{Mill_Run_h}/(24-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h}),\"\")", "sql": "CASE WHEN (24 - mill_planned_maint_h - mill_unplanned_down_h) > 0 THEN mill_run_h / (24 - mill_planned_maint_h - mill_unplanned_down_h) END", "desc": "Run hours over available hours"}
+        {"name": "Availability_pct", "label": "Mill availability", "unit": "%", "type": "pct", "calc": "IF(AND({Mill_Run_h}=\"\",{Mill_Planned_Maint_h}=\"\",{Mill_Unplanned_Down_h}=\"\"),\"\",({HOURS_PER_DAY}-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})/{HOURS_PER_DAY})", "sql": "CASE WHEN COALESCE(mill_run_h, mill_planned_maint_h, mill_unplanned_down_h) IS NOT NULL THEN (24 - COALESCE(mill_planned_maint_h, 0) - COALESCE(mill_unplanned_down_h, 0)) / 24.0 END", "desc": "(24 h minus planned and unplanned downtime) / 24 h; blank only when no mill hours are entered"},
+        {"name": "Utilisation_pct", "label": "Mill utilisation", "unit": "%", "type": "pct", "calc": "IF(AND(NOT(AND({Mill_Run_h}=\"\",{Mill_Planned_Maint_h}=\"\",{Mill_Unplanned_Down_h}=\"\")),({HOURS_PER_DAY}-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})>0),{Mill_Run_h}/({HOURS_PER_DAY}-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h}),\"\")", "sql": "CASE WHEN COALESCE(mill_run_h, mill_planned_maint_h, mill_unplanned_down_h) IS NOT NULL AND (24 - COALESCE(mill_planned_maint_h, 0) - COALESCE(mill_unplanned_down_h, 0)) > 0 THEN COALESCE(mill_run_h, 0) / (24 - COALESCE(mill_planned_maint_h, 0) - COALESCE(mill_unplanned_down_h, 0)) END", "desc": "Run hours over available hours; blank only when no mill hours are entered"}
       ]
     },
     {
@@ -4327,6 +4829,7 @@ $content_mps_schema_mps_schema_json = @'
       "title": "Material movements, one row per source, material and destination per day (or per shift)",
       "owner": "Mining (dispatch / production engineer)",
       "rows": 5000,
+      "unique": [["Date", "Shift", "Source", "Material", "Destination"]],
       "fields": [
         {"name": "Date", "label": "Date", "type": "date", "required": true, "desc": "Production day"},
         {"name": "Shift", "label": "Shift", "type": "list", "list": "Shift", "desc": "Optional; leave blank for a daily total"},
@@ -4334,15 +4837,15 @@ $content_mps_schema_mps_schema_json = @'
         {"name": "Material", "label": "Material", "type": "list", "list": "Material", "required": true, "desc": "Ore grade class or waste type"},
         {"name": "Destination", "label": "Destination", "type": "list", "list": "Destination", "required": true, "desc": "Where the material went (Lists sheet)"},
         {"name": "Tonnes_t", "label": "Tonnes", "unit": "t", "type": "number", "min": 0, "max": 200000, "required": true, "desc": "Dry tonnes moved (truck factor or weightometer)"},
-        {"name": "Grade_gpt", "label": "Grade", "unit": "g/t", "type": "number", "min": 0, "max": 100, "desc": "Grade control grade; required for ore and mineralised waste"},
+        {"name": "Grade_gpt", "label": "Grade", "unit": "g/t", "type": "number", "min": 0, "max": 100, "required_when": "{Is_Ore}=1", "required_when_sql": "material LIKE 'Ore%'", "desc": "Grade control grade; required for ore (an ore row without a grade is highlighted and reported as ungraded tonnes), recommended for mineralised waste"},
         {"name": "BCM", "label": "Volume", "unit": "bcm", "type": "number", "min": 0, "max": 100000, "desc": "Optional bank cubic metres"},
         {"name": "Loads", "label": "Truck loads", "type": "int", "min": 0, "max": 5000, "desc": "Optional truck count"},
         {"name": "Comments", "label": "Comments", "type": "text"},
-        {"name": "Source_Type", "label": "Source type", "type": "text", "calc": "IF({Source}=\"\",\"\",IFERROR(INDEX(tblSources[Type],MATCH({Source},tblSources[Source],0)),\"?\"))", "desc": "Pit or Stockpile, looked up from Lists"},
-        {"name": "Dest_Type", "label": "Destination type", "type": "text", "calc": "IF({Destination}=\"\",\"\",IFERROR(INDEX(tblDestinations[Type],MATCH({Destination},tblDestinations[Destination],0)),\"?\"))", "desc": "Stockpile, Plant or Waste, looked up from Lists"},
+        {"name": "Source_Type", "label": "Source type", "type": "text", "calc": "IF({Source}=\"\",\"\",IFERROR(INDEX(tblSources[Type],MATCH({Source},tblSources[Source],0)),\"?\"))", "values_from": "Source_Type", "warn_when": "{Source_Type}=\"?\"", "desc": "Pit or Stockpile, looked up from Lists; ? when the source is not in tblSources (row is highlighted and excluded from every KPI)"},
+        {"name": "Dest_Type", "label": "Destination type", "type": "text", "calc": "IF({Destination}=\"\",\"\",IFERROR(INDEX(tblDestinations[Type],MATCH({Destination},tblDestinations[Destination],0)),\"?\"))", "values_from": "Destination_Type", "warn_when": "{Dest_Type}=\"?\"", "desc": "Stockpile, Plant or Waste, looked up from Lists; ? when the destination is not in tblDestinations (row is highlighted)"},
         {"name": "Is_Ore", "label": "Ore flag", "type": "int", "calc": "IF({Material}=\"\",\"\",IF(LEFT({Material},3)=\"Ore\",1,0))", "sql": "CASE WHEN material LIKE 'Ore%' THEN 1 ELSE 0 END", "desc": "1 when Material starts with Ore"},
-        {"name": "Contained_oz", "label": "Contained gold", "unit": "oz", "type": "number", "calc": "IF(OR({Tonnes_t}=\"\",{Grade_gpt}=\"\"),0,{Tonnes_t}*{Grade_gpt}/{TROY})", "sql": "tonnes_t * COALESCE(grade_gpt, 0) / 31.1035", "desc": "Tonnes x grade / 31.1035, any material with a grade"},
-        {"name": "Ore_oz", "label": "Ore gold", "unit": "oz", "type": "number", "calc": "IF({Is_Ore}=1,{Contained_oz},0)", "sql": "CASE WHEN material LIKE 'Ore%' THEN tonnes_t * COALESCE(grade_gpt, 0) / 31.1035 ELSE 0 END", "desc": "Contained oz for ore rows only"}
+        {"name": "Contained_oz", "label": "Contained gold", "unit": "oz", "type": "number", "calc": "IF(OR({Tonnes_t}=\"\",{Grade_gpt}=\"\"),0,{Tonnes_t}*{Grade_gpt}/{TROY})", "sql": "tonnes_t * COALESCE(grade_gpt, 0) / {TROY}", "desc": "Tonnes x grade / 31.1035, any material with a grade"},
+        {"name": "Ore_oz", "label": "Ore gold", "unit": "oz", "type": "number", "calc": "IF({Is_Ore}=1,{Contained_oz},0)", "sql": "CASE WHEN material LIKE 'Ore%' THEN tonnes_t * COALESCE(grade_gpt, 0) / {TROY} ELSE 0 END", "desc": "Contained oz for ore rows only"}
       ]
     },
     {
@@ -4354,12 +4857,13 @@ $content_mps_schema_mps_schema_json = @'
       "fields": [
         {"name": "Date", "label": "Date", "type": "date", "key": true},
         {"name": "Drill_m", "label": "Drilled", "unit": "m", "type": "number", "min": 0, "max": 20000, "desc": "Production drill metres"},
+        {"name": "GC_Drill_m", "label": "Grade control drilled", "unit": "m", "type": "number", "min": 0, "max": 5000, "desc": "Grade control RC drill metres"},
         {"name": "Blast_t", "label": "Blasted", "unit": "t", "type": "number", "min": 0, "max": 500000, "desc": "Tonnes blasted"},
         {"name": "Explosives_kg", "label": "Explosives", "unit": "kg", "type": "number", "min": 0, "max": 200000, "desc": "Explosives consumed"},
         {"name": "Diesel_L", "label": "Diesel", "unit": "L", "type": "number", "min": 0, "max": 200000, "desc": "Mining fleet diesel"},
         {"name": "Dewatering_m3", "label": "Dewatering", "unit": "m3", "type": "number", "min": 0, "max": 500000, "desc": "Pit water pumped"},
         {"name": "Comments", "label": "Comments", "type": "text"},
-        {"name": "Powder_Factor_kgpt", "label": "Powder factor", "unit": "kg/t", "type": "number", "calc": "IF(AND({Blast_t}<>\"\",{Blast_t}>0),{Explosives_kg}/{Blast_t},\"\")", "sql": "CASE WHEN blast_t > 0 THEN explosives_kg / blast_t END", "desc": "Explosives kg per tonne blasted"}
+        {"name": "Powder_Factor_kgpt", "label": "Powder factor", "unit": "kg/t", "type": "number", "calc": "IF(AND({Blast_t}<>\"\",{Blast_t}>0),{Explosives_kg}/{Blast_t},\"\")", "sql": "CASE WHEN blast_t > 0 THEN COALESCE(explosives_kg, 0) / blast_t END", "desc": "Explosives kg per tonne blasted"}
       ]
     },
     {
@@ -4368,17 +4872,18 @@ $content_mps_schema_mps_schema_json = @'
       "title": "Mining fleet time model, one row per equipment class per day",
       "owner": "Mining (dispatch / maintenance planner)",
       "rows": 3000,
+      "unique": [["Date", "Equipment_Class"]],
       "fields": [
         {"name": "Date", "label": "Date", "type": "date", "required": true},
         {"name": "Equipment_Class", "label": "Equipment class", "type": "list", "list": "Equipment_Class", "required": true},
         {"name": "Units", "label": "Units in fleet", "type": "int", "min": 0, "max": 200, "required": true, "desc": "Number of machines of this class on site"},
         {"name": "Down_h", "label": "Down hours", "unit": "h", "type": "number", "min": 0, "max": 4800, "desc": "Sum of maintenance and breakdown hours across the class"},
-        {"name": "Operating_h", "label": "Operating hours", "unit": "h", "type": "number", "min": 0, "max": 4800, "desc": "Sum of engine or productive hours across the class"},
+        {"name": "Operating_h", "label": "Operating hours", "unit": "h", "type": "number", "min": 0, "max": 4800, "desc": "Sum of SMU engine hours across the class (one basis for every class)"},
         {"name": "Comments", "label": "Comments", "type": "text"},
-        {"name": "Calendar_h", "label": "Calendar hours", "unit": "h", "type": "number", "calc": "IF({Units}=\"\",\"\",{Units}*24)", "sql": "units * 24", "desc": "Units x 24"},
-        {"name": "Available_h", "label": "Available hours", "unit": "h", "type": "number", "calc": "IF({Units}=\"\",\"\",{Calendar_h}-{Down_h})", "sql": "units * 24 - down_h", "desc": "Calendar minus down"},
-        {"name": "Availability_pct", "label": "Availability", "unit": "%", "type": "pct", "calc": "IF(AND({Units}<>\"\",{Calendar_h}>0),{Available_h}/{Calendar_h},\"\")", "sql": "CASE WHEN units > 0 THEN (units * 24 - down_h) / (units * 24.0) END", "desc": "Available over calendar"},
-        {"name": "Utilisation_pct", "label": "Utilisation", "unit": "%", "type": "pct", "calc": "IF(AND({Units}<>\"\",{Available_h}>0),{Operating_h}/{Available_h},\"\")", "sql": "CASE WHEN (units * 24 - down_h) > 0 THEN operating_h / (units * 24 - down_h) END", "desc": "Operating over available"}
+        {"name": "Calendar_h", "label": "Calendar hours", "unit": "h", "type": "number", "calc": "IF({Units}=\"\",\"\",{Units}*{HOURS_PER_DAY})", "sql": "units * 24", "desc": "Units x 24"},
+        {"name": "Available_h", "label": "Available hours", "unit": "h", "type": "number", "calc": "IF({Units}=\"\",\"\",{Calendar_h}-{Down_h})", "sql": "units * 24 - COALESCE(down_h, 0)", "desc": "Calendar minus down"},
+        {"name": "Availability_pct", "label": "Availability", "unit": "%", "type": "pct", "calc": "IF(AND({Units}<>\"\",{Calendar_h}>0),{Available_h}/{Calendar_h},\"\")", "sql": "CASE WHEN units > 0 THEN (units * 24 - COALESCE(down_h, 0)) / (units * 24.0) END", "desc": "Available over calendar"},
+        {"name": "Utilisation_pct", "label": "Utilisation", "unit": "%", "type": "pct", "calc": "IF(AND({Units}<>\"\",{Available_h}>0),{Operating_h}/{Available_h},\"\")", "sql": "CASE WHEN (units * 24 - COALESCE(down_h, 0)) > 0 THEN COALESCE(operating_h, 0) / (units * 24 - COALESCE(down_h, 0)) END", "desc": "Operating over available"}
       ]
     },
     {
@@ -4406,20 +4911,21 @@ $content_mps_schema_mps_schema_json = @'
         {"name": "Inspections", "label": "Inspections and audits", "type": "int", "min": 0, "max": 500},
         {"name": "Comments", "label": "Comments", "type": "text"},
         {"name": "Hours_Total", "label": "Hours worked, total", "unit": "h", "type": "number", "calc": "IF(AND({Hours_Employees}=\"\",{Hours_Contractors}=\"\"),\"\",N({Hours_Employees})+N({Hours_Contractors}))", "sql": "COALESCE(hours_employees, 0) + COALESCE(hours_contractors, 0)"},
-        {"name": "Recordables", "label": "Recordable injuries", "type": "int", "calc": "N({Fatality})+N({LTI})+N({RWI})+N({MTI})", "sql": "COALESCE(fatality,0) + COALESCE(lti,0) + COALESCE(rwi,0) + COALESCE(mti,0)", "desc": "Fatalities + LTI + RWI + MTI"}
+        {"name": "Recordables", "label": "Recordable injuries", "type": "int", "calc": "IF(AND({Fatality}=\"\",{LTI}=\"\",{RWI}=\"\",{MTI}=\"\"),\"\",N({Fatality})+N({LTI})+N({RWI})+N({MTI}))", "sql": "COALESCE(fatality,0) + COALESCE(lti,0) + COALESCE(rwi,0) + COALESCE(mti,0)", "desc": "Fatalities + LTI + RWI + MTI"}
       ]
     },
     {
       "table": "tblSafetyHistory",
       "sheet": "Config",
-      "title": "Prior-year safety history by month, for rolling 12-month rates",
+      "title": "Monthly safety history for months without daily Safety rows (prior year, and this year before go-live), for rolling 12-month rates",
       "owner": "HSE",
       "prefill": "prior_months",
       "fields": [
         {"name": "Month", "label": "Month", "type": "date", "key": true, "desc": "First day of the month"},
         {"name": "Hours_Total", "label": "Hours worked", "unit": "h", "type": "number", "min": 0, "max": 2000000},
         {"name": "Recordables", "label": "Recordable injuries", "type": "int", "min": 0, "max": 100},
-        {"name": "LTI", "label": "Lost time injuries", "type": "int", "min": 0, "max": 100}
+        {"name": "LTI", "label": "Lost time injuries", "type": "int", "min": 0, "max": 100},
+        {"name": "Use", "label": "Used in rates", "type": "int", "calc": "IF({Month}=\"\",\"\",IF(COUNTIFS(tblSafety[Date],\">=\"&{Month},tblSafety[Date],\"<=\"&EOMONTH({Month},0),tblSafety[Hours_Total],\">0\")=0,1,0))", "desc": "1 when the Safety sheet has no hours for the month, so this row supplies it; 0 when daily rows exist"}
       ]
     },
     {
@@ -4456,11 +4962,11 @@ $content_mps_schema_mps_schema_json = @'
         {"name": "Hours_Worked", "label": "Hours worked", "unit": "h", "type": "number", "min": 0, "max": 2000000},
         {"name": "Drill_m", "label": "Drilled", "unit": "m", "type": "number", "min": 0, "max": 500000},
         {"name": "Diesel_L", "label": "Mining diesel", "unit": "L", "type": "number", "min": 0, "max": 10000000},
-        {"name": "Days", "label": "Days in month", "type": "int", "calc": "DAY(EOMONTH({Month},0))", "sql": "EXTRACT(DAY FROM (date_trunc('month', month) + interval '1 month - 1 day'))"},
-        {"name": "Ore_oz", "label": "Ore gold mined", "unit": "oz", "type": "number", "calc": "N({Ore_Mined_t})*N({Ore_Grade_gpt})/{TROY}", "sql": "COALESCE(ore_mined_t,0) * COALESCE(ore_grade_gpt,0) / 31.1035"},
+        {"name": "Days", "label": "Days in month", "type": "int", "calc": "DAY(EOMONTH({Month},0))", "sql": "EXTRACT(DAY FROM (date_trunc('month', month::timestamp) + INTERVAL '1 month - 1 day'))::integer", "sql_postgres": "EXTRACT(DAY FROM (date_trunc('month', month::timestamp) + INTERVAL '1 month - 1 day'))::integer", "sql_sqlite": "CAST(strftime('%d', date(month, 'start of month', '+1 month', '-1 day')) AS INTEGER)"},
+        {"name": "Ore_oz", "label": "Ore gold mined", "unit": "oz", "type": "number", "calc": "N({Ore_Mined_t})*N({Ore_Grade_gpt})/{TROY}", "sql": "COALESCE(ore_mined_t,0) * COALESCE(ore_grade_gpt,0) / {TROY}"},
         {"name": "TMM_t", "label": "Total material moved", "unit": "t", "type": "number", "calc": "N({Ore_Mined_t})+N({Waste_t})", "sql": "COALESCE(ore_mined_t,0) + COALESCE(waste_t,0)"},
-        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "N({Milled_t})*N({Head_Grade_gpt})/{TROY}", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / 31.1035"},
-        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "{Feed_oz}*N({Recovery_pct})", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / 31.1035 * COALESCE(recovery_pct,0)"}
+        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "N({Milled_t})*N({Head_Grade_gpt})/{TROY}", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / {TROY}"},
+        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "{Feed_oz}*N({Recovery_pct})", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / {TROY} * COALESCE(recovery_pct,0)"}
       ]
     },
     {
@@ -4485,14 +4991,14 @@ Write-TextFile (Join-Path $Root "01_Tools\mps\schema\mps_schema.json") $content_
 $content_mps_README_md = @'
 # mps
 
-Generator, validator and SQL builder for the Mako Production System (MPS) workbook. Everything about the data model lives in `schema/mps_schema.json`; the scripts render it. See `docs/MPS_Design.md` for the design and `docs/data_dictionary.md` for the field-level dictionary.
+Generator, validator and SQL builder for the Mako Production System (MPS) workbook. Everything about the data model lives in `schema/mps_schema.json`; the scripts render it. See `docs/MPS_Design.md` for the design and `docs/data_dictionary.md` for the field-level dictionary. On the site PC the same files sit in `C:\MakoPS\01_Tools\mps` and are driven by the PowerShell scripts described in `tools/README.md`.
 
 ## Requirements
 
 - Python 3.11 or later with `openpyxl` 3.1 (`pip install openpyxl`).
 - For the validator only: LibreOffice 24 Calc (headless recalculation) and `oletools` (`pip install oletools`) for the VBA check in `tools/xl_inspect.py`.
 
-Excel 2016 or later opens the workbook. Formulas that Excel introduced after 2010 are written with the `_xlfn.` prefix (MAXIFS, ISOWEEKNUM) so both Excel and LibreOffice evaluate them; XLOOKUP is not used.
+Excel 2016 or later opens the workbook. Functions that Excel introduced after 2010 are written with the `_xlfn.` prefix (MAXIFS, ISOWEEKNUM) so both Excel and LibreOffice evaluate them; XLOOKUP is not used.
 
 ## Build the workbook
 
@@ -4514,7 +5020,7 @@ python3 mps/build_workbook.py --out dist/demo.xlsx --sample-days 74 --report-dat
 
 The last line of the output states the sheet, table, name and formula counts (17 sheets, 20 tables, 282 names, about 146,000 formulas for 2026). The file is saved with full recalculation on load, so Excel computes everything the first time it is opened; save it once from Excel before distributing so cached values exist for readers that do not recalculate.
 
-`dist/` is for built files and is not committed.
+On site, `C:\MakoPS\01_Tools\Build-MPS.ps1` runs these two builds (blank and DEMO) into `C:\MakoPS\04_MPS`, finding or installing Python first. `dist/` is for local builds and is not committed.
 
 ## Run the validator
 
@@ -4524,18 +5030,19 @@ python3 mps/validate_workbook.py --keep --workdir /tmp/mps_check
 python3 mps/validate_workbook.py --soffice "C:\Program Files\LibreOffice\program\soffice.exe"
 ```
 
-It builds three workbooks (DEMO with the report date fixed to 10 February, DEMO with the default report date, and blank), recalculates them with LibreOffice, recomputes the key figures in plain Python from the synthetic rows without using any workbook formula, and compares them with Calc_Daily on 1 January, 10 February and the last day with data. It then checks Daily_Report, Monthly_Summary and Chart_Data against Calc_Daily, scans every sheet for error values, runs `tools/xl_inspect.py` on the built file (no external links, no VBA, no dangling references) and confirms the blank workbook recalculates without a single error. One line per check; exit code 1 on any failure. Allow about a minute.
+It builds three workbooks (DEMO with the report date fixed to 10 February, DEMO with the default report date, and blank), recalculates them with LibreOffice, recomputes the key figures in plain Python from the synthetic rows without using any workbook formula, and compares them with Calc_Daily on 1 January, 10 February and the last day with data. It then checks Daily_Report, Monthly_Summary and Chart_Data against Calc_Daily, scans every sheet for error values, runs `tools/xl_inspect.py` on the built file (no external links, no VBA, no dangling references) and confirms the blank workbook recalculates without a single error. One line per check, about 270 checks; exit code 1 on any failure. Allow about a minute.
 
 Run it after every change to the schema or the generator.
 
 ## Change the schema and regenerate
 
-Edit `schema/mps_schema.json`, then rebuild, validate and regenerate the DDL:
+Edit `schema/mps_schema.json`, then rebuild, validate, regenerate the DDL and repack the bootstrap that carries the schema and generator to site:
 
 ```bash
 python3 mps/build_workbook.py --out dist/MPS_2026.xlsx
 python3 mps/validate_workbook.py
 python3 mps/build_ddl.py
+python3 tools/build_setup.py
 ```
 
 What the schema holds:
@@ -4545,7 +5052,7 @@ What the schema holds:
 | `lists` | Drop-down values. Each becomes a table on the Lists sheet, a dynamic named range `lst_<name>` and a `ref_<name>` table in SQL. |
 | `reference_tables` | Sources, Destinations (sheet Lists) and Stockpiles (sheet Config) with seed rows. |
 | `derived_lists` | Values used by reference table columns (Source_Type, Destination_Type). |
-| `tables` | The nine input tables. `table` is the Excel table name, `sheet` the tab, `owner` the department, `prefill` one of `dates`, `months`, `prior_months`, otherwise `rows` gives the capacity. |
+| `tables` | The nine input tables. `table` is the Excel table name, `sheet` the tab, `owner` the department, `prefill` one of `dates`, `months`, `prior_months`; otherwise `rows` gives the capacity. |
 | `tables[].fields` | `name`, `label`, `type` (`date`, `text`, `list`, `number`, `int`, `pct`), `unit`, `min`, `max`, `required`, `key`, `list`, `desc`, `calc`, `sql`. |
 
 A field with `calc` becomes a grey calculated column. Inside `calc`, `{Col}` is a this-row reference to another column of the same table and `{TROY}` is the troy ounce constant. Give the same field an `sql` expression (column names in lower case) so the DDL can generate it; a `calc` without `sql` stays Excel-only and is listed as such in the SQL header.
@@ -4556,6 +5063,7 @@ Rules of thumb:
 - Adding or renaming a column, a table or a validation range needs a rebuild. The generator writes an empty workbook; move existing data across by pasting values into the matching columns of the new file, column by column if the order changed.
 - Bump `version` in the schema for any change that alters a definition. It is written to the README sheet, the SQL headers and the dictionary.
 - Never edit the built workbook's structure by hand; the next build would silently drop the change.
+- `Setup-MakoPS.ps1` embeds the schema, the three scripts and this README, so commit the regenerated bootstrap together with the change (`python3 tools/build_setup.py --check` verifies it).
 
 KPIs live in the `KPIS` list at the top of `build_workbook.py`, one `K(...)` entry each: `sum` (a SUMIFS over one table, with MTD and YTD), `ratio` (numerator and denominator built from other KPIs, recomputed per period), `custom` (an explicit Day formula, used for rolling rates and days since LTI) and `point` (a value at the date). `budget` names a tblBudget column; ratio budgets are derived when both sides are budgeted. `REPORT_LAYOUT` and `MONTHLY_KPIS` decide what appears on Daily_Report and Monthly_Summary. `build_ddl.py` translates plain SUMIFS and arithmetic automatically; anything else needs an entry in its `KPI_SQL` map.
 
@@ -4586,21 +5094,23 @@ Apply with `psql -v ON_ERROR_STOP=1 -1 -f mps/sql/schema_postgres.sql` (single t
 | `mps/sql/` | Generated DDL, committed so reviewers can read it without running anything. |
 | `docs/MPS_Design.md` | Design note. |
 | `docs/data_dictionary.md` | Generated dictionary. |
-| `tools/` | Workbook inspector and the Windows bootstrap. See `tools/README.md`. |
-| `dist/` | Built workbooks, not committed. |
+| `tools/` | Workbook inspector, the site PowerShell scripts and the bootstrap builder. See `tools/README.md`. |
+| `Setup-MakoPS.ps1` | Generated bootstrap; carries the `mps` files to the site PC. |
+| `dist/` | Local builds, not committed. |
 
 ## C:\MakoPS layout on site
 
-`Setup-MakoPS.ps1` creates the first three folders; create `04_MPS` by hand until the bootstrap is extended.
+`Setup-MakoPS.ps1` creates and fills the layout, then runs the inspection and builds the workbooks.
 
 | Folder | Content |
 |---|---|
-| `01_Tools` | `xl_inspect.py`, `Invoke-XlInspect.ps1`, `README.md`. Add `build_workbook.py`, `validate_workbook.py` and `schema\mps_schema.json` here when the workbook is rebuilt on site. |
+| `01_Tools` | `PythonEnv.ps1`, `Invoke-XlInspect.ps1`, `Build-MPS.ps1`, `Export-DailyReport.ps1`, `xl_inspect.py`, `README.md`. |
+| `01_Tools\mps` | `build_workbook.py`, `build_ddl.py`, `validate_workbook.py`, `schema\mps_schema.json` and this README. Rebuilt from the repository by the bootstrap; do not edit here. |
 | `02_Source\2026` | Working copies of the legacy PMC workbooks. Originals on X: are not touched. |
 | `03_Inspection` | `inspection_report.md` and one JSON per legacy workbook. |
-| `04_MPS` | The live workbook `MPS_2026.xlsx`. Sub-folders: `Backup` (dated copies, one per day), `PDF` (issued daily reports, named `MPS_Daily_2026-02-10.pdf`), `Archive` (previous years and superseded builds). |
+| `04_MPS` | `MPS_2026.xlsx`, the live workbook and the only file anyone edits, and `MPS_2026_DEMO.xlsx` for training. `Export-DailyReport.ps1` writes the PDFs to `04_MPS\Reports\Mako_Daily_Report_yyyy-MM-dd.pdf`. Keep dated backup copies in `04_MPS\Backup`. |
 
-The live workbook is the only file anyone edits. Re-running the inspector on `04_MPS\MPS_2026.xlsx` is the quickest proof that it still has no external links, no VBA and no error values.
+Re-running `Build-MPS.ps1` overwrites both workbooks, so copy the live file to `Backup` first and paste its table bodies into the new build. Re-running the inspector on `04_MPS` (`python xl_inspect.py C:\MakoPS\04_MPS -o C:\MakoPS\03_Inspection\mps`) is the quickest proof that the live workbook still has no external links, no VBA and no error values.
 '@
 Write-TextFile (Join-Path $Root "01_Tools\mps\README.md") $content_mps_README_md $false
 
@@ -4626,8 +5136,23 @@ if (-not $SkipCopy) {
     }
 }
 
+# ---------------------------------------------------------------- python (resolved once for both scripts below)
+$pyOk = $false
+if (-not ($SkipRun -and $SkipBuild)) {
+    Write-Host ""
+    . (Join-Path $Root "01_Tools\PythonEnv.ps1")
+    try {
+        $py = Resolve-Python
+        Write-Host "Using Python: $py"
+        $pyOk = $true
+    } catch {
+        Write-Warning $_.Exception.Message
+        Write-Warning "Inspection and workbook build skipped. Install Python 3, then run 01_Tools\Invoke-XlInspect.ps1 and 01_Tools\Build-MPS.ps1 from $Root."
+    }
+}
+
 # ---------------------------------------------------------------- run inspection
-if (-not $SkipRun) {
+if (-not $SkipRun -and $pyOk) {
     $runner = Join-Path $Root "01_Tools\Invoke-XlInspect.ps1"
     $books = @(Get-ChildItem -Path $sourceCopy -File -ErrorAction SilentlyContinue | Where-Object {
         $_.Extension -match '^\.(xlsx|xlsm|xlsb|xls|xltm|xltx)$' -and $_.Name -notlike '~$*'
@@ -4638,7 +5163,7 @@ if (-not $SkipRun) {
         Write-Host ""
         Write-Host "Running inspection"
         try {
-            & $runner -Source $sourceCopy -Out (Join-Path $Root "03_Inspection")
+            & $runner -Source $sourceCopy -Out (Join-Path $Root "03_Inspection") -NoInstall
         } catch {
             Write-Warning "Inspection failed: $($_.Exception.Message). Fix the cause and run $runner again."
         }
@@ -4646,18 +5171,23 @@ if (-not $SkipRun) {
         if (Test-Path $report) {
             Write-Host ""
             Write-Host "Inspection report: $report"
-            try { Start-Process explorer.exe (Join-Path $Root "03_Inspection") } catch { }
         }
     }
 }
 
 # ---------------------------------------------------------------- build MPS workbooks
-if (-not $SkipBuild) {
+if (-not $SkipBuild -and $pyOk) {
     $builder = Join-Path $Root "01_Tools\Build-MPS.ps1"
     Write-Host ""
     Write-Host "Building the MPS workbooks for $Year"
-    & $builder -Root $Root -Year $Year
+    try {
+        & $builder -Root $Root -Year $Year -NoInstall -NoOpen
+    } catch {
+        Write-Warning "Build failed: $($_.Exception.Message). Fix the cause and run $builder again."
+    }
 }
 
 Write-Host ""
 Write-Host "Setup finished. Tools are in $(Join-Path $Root '01_Tools'); see README.md there."
+# one Explorer window on the root, after everything has been written
+try { Start-Process explorer.exe $Root } catch { }
