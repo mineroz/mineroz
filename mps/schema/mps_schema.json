@@ -1,0 +1,280 @@
+{
+  "system": "Mako Production System",
+  "version": "0.1.0",
+  "site": {
+    "name": "Mako Gold Mine",
+    "company": "Petowal Mining Company S.A.",
+    "owner": "Resolute Mining Limited",
+    "country": "Senegal",
+    "timezone": "GMT"
+  },
+  "constants": {
+    "TROY_OZ_G": 31.1035,
+    "HOURS_PER_DAY": 24,
+    "RATE_BASIS_HOURS": 1000000
+  },
+  "lists": {
+    "Shift": ["Day", "Night"],
+    "Material": ["Ore HG", "Ore MG", "Ore LG", "Mineralised Waste", "Waste", "Topsoil"],
+    "Area": ["Safety", "Mining", "Geology", "Processing", "Maintenance", "Environment", "Community", "Supply", "People", "Projects", "General"],
+    "Equipment_Class": ["Excavator", "Haul Truck", "Drill", "Dozer", "Grader", "Water Cart", "Wheel Loader", "Ancillary"],
+    "Gold_Movement_Type": ["Shipment", "Sale"],
+    "Yes_No": ["Y", "N"]
+  },
+  "reference_tables": {
+    "Sources": {
+      "table": "tblSources",
+      "sheet": "Lists",
+      "key": "Source",
+      "columns": [
+        {"name": "Source", "type": "text", "desc": "Origin of a material movement: a pit or a stockpile"},
+        {"name": "Type", "type": "list", "list": "Source_Type", "desc": "Pit = ex-pit (counts to TMM and strip ratio); Stockpile = rehandle"}
+      ],
+      "rows": [
+        ["Petowal Pit", "Pit"],
+        ["Satellite Pit", "Pit"],
+        ["ROM Pad", "Stockpile"],
+        ["Stockpile HG", "Stockpile"],
+        ["Stockpile MG", "Stockpile"],
+        ["Stockpile LG", "Stockpile"],
+        ["Mineralised Waste Dump", "Stockpile"]
+      ]
+    },
+    "Destinations": {
+      "table": "tblDestinations",
+      "sheet": "Lists",
+      "key": "Destination",
+      "columns": [
+        {"name": "Destination", "type": "text", "desc": "Where the material was delivered"},
+        {"name": "Type", "type": "list", "list": "Destination_Type", "desc": "Stockpile = enters a stockpile balance; Plant = direct tip to crusher; Waste = dump"}
+      ],
+      "rows": [
+        ["ROM Pad", "Stockpile"],
+        ["Crusher Direct Tip", "Plant"],
+        ["Stockpile HG", "Stockpile"],
+        ["Stockpile MG", "Stockpile"],
+        ["Stockpile LG", "Stockpile"],
+        ["Mineralised Waste Dump", "Stockpile"],
+        ["Waste Dump", "Waste"],
+        ["TSF Wall", "Waste"],
+        ["Topsoil Stockpile", "Waste"]
+      ]
+    },
+    "Stockpiles": {
+      "table": "tblStockpiles",
+      "sheet": "Config",
+      "key": "Stockpile",
+      "columns": [
+        {"name": "Stockpile", "type": "text", "desc": "Stockpile name; must match a Source and a Destination"},
+        {"name": "Opening_t", "type": "number", "unit": "t", "desc": "Surveyed tonnes at the start of the year"},
+        {"name": "Opening_gpt", "type": "number", "unit": "g/t", "desc": "Grade of the opening balance"},
+        {"name": "Plant_Feed", "type": "list", "list": "Yes_No", "desc": "Y if the plant draws its feed from this stockpile (milled tonnes are deducted)"},
+        {"name": "Survey_Date", "type": "date", "desc": "Date of the opening survey"}
+      ],
+      "rows": [
+        ["ROM Pad", 0, 0, "Y", null],
+        ["Stockpile HG", 0, 0, "N", null],
+        ["Stockpile MG", 0, 0, "N", null],
+        ["Stockpile LG", 0, 0, "N", null],
+        ["Mineralised Waste Dump", 0, 0, "N", null]
+      ]
+    }
+  },
+  "derived_lists": {
+    "Source_Type": ["Pit", "Stockpile"],
+    "Destination_Type": ["Stockpile", "Plant", "Waste"]
+  },
+  "tables": [
+    {
+      "table": "tblPlant",
+      "sheet": "Plant",
+      "title": "Processing plant, one row per day",
+      "owner": "Processing (met accountant / shift supervisor)",
+      "prefill": "dates",
+      "fields": [
+        {"name": "Date", "label": "Date", "type": "date", "key": true, "desc": "Production day (day shift start to night shift end)"},
+        {"name": "Crushed_t", "label": "Crushed", "unit": "t", "type": "number", "min": 0, "max": 50000, "desc": "Dry tonnes through the primary crusher"},
+        {"name": "Milled_t", "label": "Milled", "unit": "t", "type": "number", "min": 0, "max": 50000, "desc": "Dry tonnes milled (mill feed weightometer)"},
+        {"name": "Head_Grade_gpt", "label": "Head grade", "unit": "g/t", "type": "number", "min": 0, "max": 50, "desc": "Mill feed grade from the daily metallurgical balance"},
+        {"name": "Tails_Grade_gpt", "label": "Tails grade", "unit": "g/t", "type": "number", "min": 0, "max": 10, "desc": "Final tails grade"},
+        {"name": "Gravity_Gold_oz", "label": "Gravity gold", "unit": "oz", "type": "number", "min": 0, "max": 5000, "desc": "Gold recovered by the gravity circuit (part of total recovered)"},
+        {"name": "Gold_Poured_oz", "label": "Gold poured", "unit": "oz", "type": "number", "min": 0, "max": 20000, "desc": "Fine gold in dore poured on the day"},
+        {"name": "Mill_Run_h", "label": "Mill run hours", "unit": "h", "type": "number", "min": 0, "max": 24, "desc": "Hours the mill was running"},
+        {"name": "Mill_Planned_Maint_h", "label": "Planned maintenance", "unit": "h", "type": "number", "min": 0, "max": 24, "desc": "Planned maintenance downtime"},
+        {"name": "Mill_Unplanned_Down_h", "label": "Unplanned downtime", "unit": "h", "type": "number", "min": 0, "max": 24, "desc": "Unplanned downtime (breakdowns, power, no feed)"},
+        {"name": "Crusher_Run_h", "label": "Crusher run hours", "unit": "h", "type": "number", "min": 0, "max": 24, "desc": "Primary crusher running hours"},
+        {"name": "Cyanide_kg", "label": "Cyanide", "unit": "kg", "type": "number", "min": 0, "max": 50000, "desc": "Sodium cyanide consumed"},
+        {"name": "Lime_kg", "label": "Lime", "unit": "kg", "type": "number", "min": 0, "max": 100000, "desc": "Lime consumed"},
+        {"name": "Grinding_Media_kg", "label": "Grinding media", "unit": "kg", "type": "number", "min": 0, "max": 50000, "desc": "Grinding media added"},
+        {"name": "Power_kWh", "label": "Power", "unit": "kWh", "type": "number", "min": 0, "max": 1000000, "desc": "Plant power consumed"},
+        {"name": "Raw_Water_m3", "label": "Raw water", "unit": "m3", "type": "number", "min": 0, "max": 100000, "desc": "Raw water drawn"},
+        {"name": "GIC_oz", "label": "Gold in circuit", "unit": "oz", "type": "number", "min": 0, "max": 50000, "desc": "Gold in circuit at end of day (point value, not additive)"},
+        {"name": "Comments", "label": "Comments", "type": "text", "desc": "Short note; use the Commentary sheet for the report narrative"},
+        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "IF({Milled_t}=\"\",\"\",{Milled_t}*{Head_Grade_gpt}/{TROY})", "sql": "milled_t * head_grade_gpt / 31.1035", "desc": "Milled t x head grade / 31.1035"},
+        {"name": "Tails_oz", "label": "Gold lost to tails", "unit": "oz", "type": "number", "calc": "IF({Milled_t}=\"\",\"\",{Milled_t}*{Tails_Grade_gpt}/{TROY})", "sql": "milled_t * tails_grade_gpt / 31.1035", "desc": "Milled t x tails grade / 31.1035"},
+        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "IF({Milled_t}=\"\",\"\",{Feed_oz}-{Tails_oz})", "sql": "milled_t * (head_grade_gpt - tails_grade_gpt) / 31.1035", "desc": "Feed oz minus tails oz"},
+        {"name": "Recovery_pct", "label": "Recovery", "unit": "%", "type": "pct", "calc": "IF(AND({Milled_t}<>\"\",{Feed_oz}>0),{Recovered_oz}/{Feed_oz},\"\")", "sql": "CASE WHEN head_grade_gpt > 0 THEN 1 - tails_grade_gpt / head_grade_gpt END", "desc": "1 minus tails grade over head grade"},
+        {"name": "Throughput_tph", "label": "Throughput", "unit": "t/h", "type": "number", "calc": "IF(AND({Milled_t}<>\"\",{Mill_Run_h}>0),{Milled_t}/{Mill_Run_h},\"\")", "sql": "CASE WHEN mill_run_h > 0 THEN milled_t / mill_run_h END", "desc": "Milled t per running hour"},
+        {"name": "Availability_pct", "label": "Mill availability", "unit": "%", "type": "pct", "calc": "IF({Mill_Run_h}=\"\",\"\",(24-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})/24)", "sql": "(24 - mill_planned_maint_h - mill_unplanned_down_h) / 24.0", "desc": "(24 h minus planned and unplanned downtime) / 24 h"},
+        {"name": "Utilisation_pct", "label": "Mill utilisation", "unit": "%", "type": "pct", "calc": "IF(AND({Mill_Run_h}<>\"\",(24-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h})>0),{Mill_Run_h}/(24-{Mill_Planned_Maint_h}-{Mill_Unplanned_Down_h}),\"\")", "sql": "CASE WHEN (24 - mill_planned_maint_h - mill_unplanned_down_h) > 0 THEN mill_run_h / (24 - mill_planned_maint_h - mill_unplanned_down_h) END", "desc": "Run hours over available hours"}
+      ]
+    },
+    {
+      "table": "tblMovement",
+      "sheet": "Mining_Movements",
+      "title": "Material movements, one row per source, material and destination per day (or per shift)",
+      "owner": "Mining (dispatch / production engineer)",
+      "rows": 5000,
+      "fields": [
+        {"name": "Date", "label": "Date", "type": "date", "required": true, "desc": "Production day"},
+        {"name": "Shift", "label": "Shift", "type": "list", "list": "Shift", "desc": "Optional; leave blank for a daily total"},
+        {"name": "Source", "label": "Source", "type": "list", "list": "Source", "required": true, "desc": "Pit or stockpile the material came from (Lists sheet)"},
+        {"name": "Material", "label": "Material", "type": "list", "list": "Material", "required": true, "desc": "Ore grade class or waste type"},
+        {"name": "Destination", "label": "Destination", "type": "list", "list": "Destination", "required": true, "desc": "Where the material went (Lists sheet)"},
+        {"name": "Tonnes_t", "label": "Tonnes", "unit": "t", "type": "number", "min": 0, "max": 200000, "required": true, "desc": "Dry tonnes moved (truck factor or weightometer)"},
+        {"name": "Grade_gpt", "label": "Grade", "unit": "g/t", "type": "number", "min": 0, "max": 100, "desc": "Grade control grade; required for ore and mineralised waste"},
+        {"name": "BCM", "label": "Volume", "unit": "bcm", "type": "number", "min": 0, "max": 100000, "desc": "Optional bank cubic metres"},
+        {"name": "Loads", "label": "Truck loads", "type": "int", "min": 0, "max": 5000, "desc": "Optional truck count"},
+        {"name": "Comments", "label": "Comments", "type": "text"},
+        {"name": "Source_Type", "label": "Source type", "type": "text", "calc": "IF({Source}=\"\",\"\",IFERROR(INDEX(tblSources[Type],MATCH({Source},tblSources[Source],0)),\"?\"))", "desc": "Pit or Stockpile, looked up from Lists"},
+        {"name": "Dest_Type", "label": "Destination type", "type": "text", "calc": "IF({Destination}=\"\",\"\",IFERROR(INDEX(tblDestinations[Type],MATCH({Destination},tblDestinations[Destination],0)),\"?\"))", "desc": "Stockpile, Plant or Waste, looked up from Lists"},
+        {"name": "Is_Ore", "label": "Ore flag", "type": "int", "calc": "IF({Material}=\"\",\"\",IF(LEFT({Material},3)=\"Ore\",1,0))", "sql": "CASE WHEN material LIKE 'Ore%' THEN 1 ELSE 0 END", "desc": "1 when Material starts with Ore"},
+        {"name": "Contained_oz", "label": "Contained gold", "unit": "oz", "type": "number", "calc": "IF(OR({Tonnes_t}=\"\",{Grade_gpt}=\"\"),0,{Tonnes_t}*{Grade_gpt}/{TROY})", "sql": "tonnes_t * COALESCE(grade_gpt, 0) / 31.1035", "desc": "Tonnes x grade / 31.1035, any material with a grade"},
+        {"name": "Ore_oz", "label": "Ore gold", "unit": "oz", "type": "number", "calc": "IF({Is_Ore}=1,{Contained_oz},0)", "sql": "CASE WHEN material LIKE 'Ore%' THEN tonnes_t * COALESCE(grade_gpt, 0) / 31.1035 ELSE 0 END", "desc": "Contained oz for ore rows only"}
+      ]
+    },
+    {
+      "table": "tblMiningDaily",
+      "sheet": "Mining_Daily",
+      "title": "Mining daily totals, one row per day",
+      "owner": "Mining (production engineer)",
+      "prefill": "dates",
+      "fields": [
+        {"name": "Date", "label": "Date", "type": "date", "key": true},
+        {"name": "Drill_m", "label": "Drilled", "unit": "m", "type": "number", "min": 0, "max": 20000, "desc": "Production drill metres"},
+        {"name": "Blast_t", "label": "Blasted", "unit": "t", "type": "number", "min": 0, "max": 500000, "desc": "Tonnes blasted"},
+        {"name": "Explosives_kg", "label": "Explosives", "unit": "kg", "type": "number", "min": 0, "max": 200000, "desc": "Explosives consumed"},
+        {"name": "Diesel_L", "label": "Diesel", "unit": "L", "type": "number", "min": 0, "max": 200000, "desc": "Mining fleet diesel"},
+        {"name": "Dewatering_m3", "label": "Dewatering", "unit": "m3", "type": "number", "min": 0, "max": 500000, "desc": "Pit water pumped"},
+        {"name": "Comments", "label": "Comments", "type": "text"},
+        {"name": "Powder_Factor_kgpt", "label": "Powder factor", "unit": "kg/t", "type": "number", "calc": "IF(AND({Blast_t}<>\"\",{Blast_t}>0),{Explosives_kg}/{Blast_t},\"\")", "sql": "CASE WHEN blast_t > 0 THEN explosives_kg / blast_t END", "desc": "Explosives kg per tonne blasted"}
+      ]
+    },
+    {
+      "table": "tblFleet",
+      "sheet": "Fleet",
+      "title": "Mining fleet time model, one row per equipment class per day",
+      "owner": "Mining (dispatch / maintenance planner)",
+      "rows": 3000,
+      "fields": [
+        {"name": "Date", "label": "Date", "type": "date", "required": true},
+        {"name": "Equipment_Class", "label": "Equipment class", "type": "list", "list": "Equipment_Class", "required": true},
+        {"name": "Units", "label": "Units in fleet", "type": "int", "min": 0, "max": 200, "required": true, "desc": "Number of machines of this class on site"},
+        {"name": "Down_h", "label": "Down hours", "unit": "h", "type": "number", "min": 0, "max": 4800, "desc": "Sum of maintenance and breakdown hours across the class"},
+        {"name": "Operating_h", "label": "Operating hours", "unit": "h", "type": "number", "min": 0, "max": 4800, "desc": "Sum of engine or productive hours across the class"},
+        {"name": "Comments", "label": "Comments", "type": "text"},
+        {"name": "Calendar_h", "label": "Calendar hours", "unit": "h", "type": "number", "calc": "IF({Units}=\"\",\"\",{Units}*24)", "sql": "units * 24", "desc": "Units x 24"},
+        {"name": "Available_h", "label": "Available hours", "unit": "h", "type": "number", "calc": "IF({Units}=\"\",\"\",{Calendar_h}-{Down_h})", "sql": "units * 24 - down_h", "desc": "Calendar minus down"},
+        {"name": "Availability_pct", "label": "Availability", "unit": "%", "type": "pct", "calc": "IF(AND({Units}<>\"\",{Calendar_h}>0),{Available_h}/{Calendar_h},\"\")", "sql": "CASE WHEN units > 0 THEN (units * 24 - down_h) / (units * 24.0) END", "desc": "Available over calendar"},
+        {"name": "Utilisation_pct", "label": "Utilisation", "unit": "%", "type": "pct", "calc": "IF(AND({Units}<>\"\",{Available_h}>0),{Operating_h}/{Available_h},\"\")", "sql": "CASE WHEN (units * 24 - down_h) > 0 THEN operating_h / (units * 24 - down_h) END", "desc": "Operating over available"}
+      ]
+    },
+    {
+      "table": "tblSafety",
+      "sheet": "Safety",
+      "title": "Safety, health, environment and community, one row per day",
+      "owner": "HSE",
+      "prefill": "dates",
+      "fields": [
+        {"name": "Date", "label": "Date", "type": "date", "key": true},
+        {"name": "Hours_Employees", "label": "Hours worked, employees", "unit": "h", "type": "number", "min": 0, "max": 50000},
+        {"name": "Hours_Contractors", "label": "Hours worked, contractors", "unit": "h", "type": "number", "min": 0, "max": 50000},
+        {"name": "Fatality", "label": "Fatalities", "type": "int", "min": 0, "max": 50},
+        {"name": "LTI", "label": "Lost time injuries", "type": "int", "min": 0, "max": 50},
+        {"name": "RWI", "label": "Restricted work injuries", "type": "int", "min": 0, "max": 50},
+        {"name": "MTI", "label": "Medical treatment injuries", "type": "int", "min": 0, "max": 50},
+        {"name": "FAI", "label": "First aid injuries", "type": "int", "min": 0, "max": 50},
+        {"name": "Near_Miss", "label": "Near misses", "type": "int", "min": 0, "max": 500},
+        {"name": "Hazard_Reports", "label": "Hazard reports", "type": "int", "min": 0, "max": 5000},
+        {"name": "HPI", "label": "High potential incidents", "type": "int", "min": 0, "max": 50},
+        {"name": "Env_Incidents", "label": "Environmental incidents", "type": "int", "min": 0, "max": 50},
+        {"name": "Community_Incidents", "label": "Community incidents or grievances", "type": "int", "min": 0, "max": 50},
+        {"name": "Vehicle_Incidents", "label": "Vehicle incidents", "type": "int", "min": 0, "max": 50},
+        {"name": "Toolbox_Talks", "label": "Toolbox talks", "type": "int", "min": 0, "max": 500},
+        {"name": "Inspections", "label": "Inspections and audits", "type": "int", "min": 0, "max": 500},
+        {"name": "Comments", "label": "Comments", "type": "text"},
+        {"name": "Hours_Total", "label": "Hours worked, total", "unit": "h", "type": "number", "calc": "IF(AND({Hours_Employees}=\"\",{Hours_Contractors}=\"\"),\"\",N({Hours_Employees})+N({Hours_Contractors}))", "sql": "COALESCE(hours_employees, 0) + COALESCE(hours_contractors, 0)"},
+        {"name": "Recordables", "label": "Recordable injuries", "type": "int", "calc": "N({Fatality})+N({LTI})+N({RWI})+N({MTI})", "sql": "COALESCE(fatality,0) + COALESCE(lti,0) + COALESCE(rwi,0) + COALESCE(mti,0)", "desc": "Fatalities + LTI + RWI + MTI"}
+      ]
+    },
+    {
+      "table": "tblSafetyHistory",
+      "sheet": "Config",
+      "title": "Prior-year safety history by month, for rolling 12-month rates",
+      "owner": "HSE",
+      "prefill": "prior_months",
+      "fields": [
+        {"name": "Month", "label": "Month", "type": "date", "key": true, "desc": "First day of the month"},
+        {"name": "Hours_Total", "label": "Hours worked", "unit": "h", "type": "number", "min": 0, "max": 2000000},
+        {"name": "Recordables", "label": "Recordable injuries", "type": "int", "min": 0, "max": 100},
+        {"name": "LTI", "label": "Lost time injuries", "type": "int", "min": 0, "max": 100}
+      ]
+    },
+    {
+      "table": "tblGold",
+      "sheet": "Gold",
+      "title": "Gold shipments and sales",
+      "owner": "Finance / gold room",
+      "rows": 400,
+      "fields": [
+        {"name": "Date", "label": "Date", "type": "date", "required": true},
+        {"name": "Type", "label": "Type", "type": "list", "list": "Gold_Movement_Type", "required": true, "desc": "Shipment (dore leaves site) or Sale (refinery outturn sold)"},
+        {"name": "Dore_kg", "label": "Dore weight", "unit": "kg", "type": "number", "min": 0, "max": 5000},
+        {"name": "Gold_oz", "label": "Gold", "unit": "oz", "type": "number", "min": 0, "max": 100000, "required": true},
+        {"name": "Silver_oz", "label": "Silver", "unit": "oz", "type": "number", "min": 0, "max": 100000},
+        {"name": "Reference", "label": "Reference", "type": "text", "desc": "Shipment or sale reference"},
+        {"name": "Comments", "label": "Comments", "type": "text"}
+      ]
+    },
+    {
+      "table": "tblBudget",
+      "sheet": "Budget",
+      "title": "Monthly budget (or latest forecast), one row per month",
+      "owner": "Technical services / finance",
+      "prefill": "months",
+      "fields": [
+        {"name": "Month", "label": "Month", "type": "date", "key": true, "desc": "First day of the month"},
+        {"name": "Ore_Mined_t", "label": "Ore mined", "unit": "t", "type": "number", "min": 0, "max": 5000000},
+        {"name": "Ore_Grade_gpt", "label": "Ore grade mined", "unit": "g/t", "type": "number", "min": 0, "max": 50},
+        {"name": "Waste_t", "label": "Waste mined", "unit": "t", "type": "number", "min": 0, "max": 20000000},
+        {"name": "Milled_t", "label": "Milled", "unit": "t", "type": "number", "min": 0, "max": 5000000},
+        {"name": "Head_Grade_gpt", "label": "Head grade", "unit": "g/t", "type": "number", "min": 0, "max": 50},
+        {"name": "Recovery_pct", "label": "Recovery", "unit": "%", "type": "pct", "min": 0, "max": 1},
+        {"name": "Gold_Poured_oz", "label": "Gold poured", "unit": "oz", "type": "number", "min": 0, "max": 500000},
+        {"name": "Hours_Worked", "label": "Hours worked", "unit": "h", "type": "number", "min": 0, "max": 2000000},
+        {"name": "Drill_m", "label": "Drilled", "unit": "m", "type": "number", "min": 0, "max": 500000},
+        {"name": "Diesel_L", "label": "Mining diesel", "unit": "L", "type": "number", "min": 0, "max": 10000000},
+        {"name": "Days", "label": "Days in month", "type": "int", "calc": "DAY(EOMONTH({Month},0))", "sql": "EXTRACT(DAY FROM (date_trunc('month', month) + interval '1 month - 1 day'))"},
+        {"name": "Ore_oz", "label": "Ore gold mined", "unit": "oz", "type": "number", "calc": "N({Ore_Mined_t})*N({Ore_Grade_gpt})/{TROY}", "sql": "COALESCE(ore_mined_t,0) * COALESCE(ore_grade_gpt,0) / 31.1035"},
+        {"name": "TMM_t", "label": "Total material moved", "unit": "t", "type": "number", "calc": "N({Ore_Mined_t})+N({Waste_t})", "sql": "COALESCE(ore_mined_t,0) + COALESCE(waste_t,0)"},
+        {"name": "Feed_oz", "label": "Contained gold in feed", "unit": "oz", "type": "number", "calc": "N({Milled_t})*N({Head_Grade_gpt})/{TROY}", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / 31.1035"},
+        {"name": "Recovered_oz", "label": "Gold recovered", "unit": "oz", "type": "number", "calc": "{Feed_oz}*N({Recovery_pct})", "sql": "COALESCE(milled_t,0) * COALESCE(head_grade_gpt,0) / 31.1035 * COALESCE(recovery_pct,0)"}
+      ]
+    },
+    {
+      "table": "tblCommentary",
+      "sheet": "Commentary",
+      "title": "Daily report narrative, one row per comment",
+      "owner": "All departments; compiled by the production engineer",
+      "rows": 3000,
+      "fields": [
+        {"name": "Date", "label": "Date", "type": "date", "required": true},
+        {"name": "Area", "label": "Area", "type": "list", "list": "Area", "required": true},
+        {"name": "Comment", "label": "Comment", "type": "text", "required": true, "desc": "One or two sentences; appears on the daily report"},
+        {"name": "Author", "label": "Author", "type": "text"},
+        {"name": "Seq_Day", "label": "Sequence in day", "type": "int", "calc": "IF({Date}=\"\",\"\",COUNTIFS(INDEX(tblCommentary[Date],1):{Date},{Date}))", "desc": "Running number of comments for the same day (report helper)"},
+        {"name": "Key_Day", "label": "Day key", "type": "text", "calc": "IF({Date}=\"\",\"\",{Date}&\"|\"&{Seq_Day})", "desc": "Report lookup key"}
+      ]
+    }
+  ]
+}
